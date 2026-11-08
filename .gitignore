@@ -1,0 +1,24 @@
+# Build output
+/app/target/
+/app/shots/
+/dist/chaoyue-cnc-1.1.0-win64/
+
+# Craft Anything / analysis working files
+/checks/
+/capture/
+/reference/
+/inbox/
+/investigation.cany/
+/build*.txt
+/build-activity.log
+/craft.json
+/feed.json
+/usage.json
+*.ini
+*.log
+
+# OS / editor files
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
