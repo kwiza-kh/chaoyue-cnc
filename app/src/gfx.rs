@@ -2,7 +2,9 @@
 //! Everything is painted into an RGBA pixmap with tiny-skia and then blitted
 //! to the Win32 window by the platform layer.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use tiny_skia::{
@@ -38,7 +40,12 @@ impl Color {
         Self { a, ..self }
     }
     pub fn sk(self) -> SkColor {
-        SkColor::from_rgba8(self.r, self.g, self.b, self.a)
+        // The frame is kept in the byte order a Win32 BI_RGB DIB expects
+        // (B,G,R,A) so the presentation step can be a plain memory copy.
+        // `Color` itself still uses the normal R,G,B order at every call site;
+        // the swap lives only here, in hand-written gradient fills, and when
+        // encoding a PNG for the screenshot mode.
+        SkColor::from_rgba8(self.b, self.g, self.r, self.a)
     }
     pub fn mix(self, other: Color, t: f32) -> Color {
         let t = t.clamp(0.0, 1.0);
@@ -173,7 +180,13 @@ struct TextBitmap {
     pixmap: Pixmap,
     ascent: f32,
     pad: i32,
+    /// Last frame this bitmap was used. Keeping the hottest text instead of
+    /// throwing the whole cache away avoids a periodic re-rasterise hitch when
+    /// a long program is scrolled.
+    used: u64,
 }
+
+static TEXT_CLOCK: AtomicU64 = AtomicU64::new(1);
 
 fn blend_pixmap_at(dst: &mut Pixmap, x: i32, y: i32, src: &Pixmap) {
     let sw = src.width() as i32;
@@ -234,14 +247,37 @@ impl FontFace {
         (-self.face.descender() as f32) * self.scale(size)
     }
     pub fn advance(&self, ch: char, size: f32) -> f32 {
-        match self.face.glyph_index(ch) {
+        if size <= 0.01 {
+            return 0.0;
+        }
+        thread_local! {
+            // Measuring a CJK line used to do one cmap + hmtx lookup per
+            // character on every frame (and once per growing prefix inside
+            // wrapping/truncation). The metrics are immutable for a face and
+            // size, so remember them.
+            static ADVANCES: RefCell<HashMap<(u8, u32, u32), f32>> =
+                RefCell::new(HashMap::new());
+        }
+        let key = (self.id, ch as u32, size.to_bits());
+        if let Some(v) = ADVANCES.with(|c| c.borrow().get(&key).copied()) {
+            return v;
+        }
+        let v = match self.face.glyph_index(ch) {
             Some(gid) => self
                 .face
                 .glyph_hor_advance(gid)
                 .unwrap_or(self.face.units_per_em() / 2) as f32
                 * self.scale(size),
             None => size * 0.55,
-        }
+        };
+        ADVANCES.with(|c| {
+            let mut m = c.borrow_mut();
+            if m.len() > 8192 {
+                m.clear();
+            }
+            m.insert(key, v);
+        });
+        v
     }
     pub fn width(&self, text: &str, size: f32) -> f32 {
         text.chars().map(|c| self.advance(c, size)).sum()
@@ -258,8 +294,12 @@ impl FontFace {
             | (color.b as u32) << 8
             | color.a as u32;
         let key = (self.id, text.to_string(), size.to_bits(), color_key);
+        let now = TEXT_CLOCK.fetch_add(1, Ordering::Relaxed);
         let Ok(mut guard) = cache.lock() else { return };
-        let bmp = guard.entry(key).or_insert_with(|| {
+        let bmp = if let Some(bmp) = guard.get_mut(&key) {
+            bmp.used = now;
+            bmp
+        } else {
             let width = self.width(text, size).ceil().max(1.0) as u32;
             let ascent = self.ascent(size);
             let descent = self.descent(size);
@@ -283,18 +323,27 @@ impl FontFace {
                     );
                 }
             }
-            TextBitmap {
-                pixmap: tmp,
-                ascent,
-                pad,
+            guard.insert(
+                key.clone(),
+                TextBitmap {
+                    pixmap: tmp,
+                    ascent,
+                    pad,
+                    used: now,
+                },
+            );
+            if guard.len() > 2048 {
+                let cutoff = now.saturating_sub(768);
+                guard.retain(|_, v| v.used >= cutoff);
+                if guard.len() > 4096 {
+                    guard.clear();
+                }
             }
-        });
+            guard.get_mut(&key).expect("text bitmap just inserted")
+        };
         let px = x.round() as i32 - bmp.pad;
         let py = (baseline - bmp.ascent).round() as i32 - bmp.pad;
         blend_pixmap_at(pixmap, px, py, &bmp.pixmap);
-        if guard.len() > 2048 {
-            guard.clear();
-        }
     }
 
     /// Build (and cache) the whole text run as one path at the origin. Drawing a
@@ -460,16 +509,16 @@ impl Painter {
             let t = ((y as f32 + 0.5 - r.y) / r.h).clamp(0.0, 1.0);
             let c = top.mix(bottom, t);
             let a = c.a as u32;
-            let (cr, cg, cb) = if a == 255 {
-                (c.r, c.g, c.b)
+            let (cb, cg, cr) = if a == 255 {
+                (c.b, c.g, c.r)
             } else {
                 (
-                    (c.r as u32 * a / 255) as u8,
-                    (c.g as u32 * a / 255) as u8,
                     (c.b as u32 * a / 255) as u8,
+                    (c.g as u32 * a / 255) as u8,
+                    (c.r as u32 * a / 255) as u8,
                 )
             };
-            let px = [cr, cg, cb, a as u8];
+            let px = [cb, cg, cr, a as u8];
             let row = y as usize * width;
             for x in x0..x1 {
                 let i = (row + x as usize) * 4;
@@ -622,6 +671,11 @@ impl Painter {
         }
         self.stroke_polyline(&pts, c, width, false);
     }
+    /// Stroke a pre-built batch path with one paint/stroke setup. Used by the
+    /// drawing board to submit all visible outlines together.
+    pub fn stroke_batch(&mut self, pb: PathBuilder, c: Color, width: f32) {
+        self.stroke_path(pb, c, width, false);
+    }
     fn stroke_path(&mut self, pb: PathBuilder, c: Color, width: f32, _closed: bool) {
         if let Some(path) = pb.finish() {
             let mut paint = Paint::default();
@@ -701,15 +755,19 @@ impl Painter {
         let mut py = y;
         for para in text.split('\n') {
             let mut line = String::new();
+            let mut w = 0.0f32;
             for ch in para.chars() {
-                let mut test = line.clone();
-                test.push(ch);
-                if self.text_width(&test, size) > max_w && !line.is_empty() {
+                let adv = fonts().ui.advance(ch, size);
+                // Measure once while filling the line instead of rebuilding
+                // and re-measuring the whole prefix for every character.
+                if w + adv > max_w && !line.is_empty() {
                     self.text_top(x, py, &line, size, c);
                     py += line_h;
                     line.clear();
+                    w = 0.0;
                 }
                 line.push(ch);
+                w += adv;
             }
             if !line.is_empty() {
                 self.text_top(x, py, &line, size, c);
@@ -751,7 +809,14 @@ impl Painter {
         }
     }
     pub fn png(&self) -> Result<Vec<u8>, String> {
-        self.pixmap.encode_png().map_err(|e| e.to_string())
+        // `self.pixmap` holds display-order B,G,R,A pixels. The PNG encoder
+        // expects R,G,B,A, so swap the two colour channels in a throw-away
+        // copy; this runs only for the --screenshot test, never per frame.
+        let mut out = self.pixmap.clone();
+        for px in out.data_mut().chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        out.encode_png().map_err(|e| e.to_string())
     }
 }
 

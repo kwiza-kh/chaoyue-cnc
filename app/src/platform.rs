@@ -7,14 +7,29 @@ use std::path::PathBuf;
 use tiny_skia::Pixmap;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, SRCCOPY,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetDeviceCaps,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, SRCCOPY,
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OPENFILENAMEW, OFN_EXPLORER, OFN_FILEMUSTEXIST,
     OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, SetWindowTextW};
+
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(period: u32) -> u32;
+}
+
+/// Ask Windows for 1 ms timer granularity while the editor is open. The
+/// message loop uses a short frame interval to keep mouse-to-picture latency
+/// low; without this the default ~15.6 ms timer would turn that into a much
+/// choppier 60-ish Hz presentation.
+pub fn begin_high_res_timer() {
+    unsafe {
+        timeBeginPeriod(1);
+    }
+}
 
 pub fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -35,6 +50,26 @@ pub fn set_title(hwnd: HWND, title: &str) {
     unsafe {
         let w = wide(title);
         SetWindowTextW(hwnd, w.as_ptr());
+    }
+}
+
+/// Current display refresh rate (`VREFRESH` = 116), clamped to a sane range.
+/// A 60 Hz office monitor and a 240 Hz gaming monitor should not be paced the
+/// same way: the former only needs ~60 frames/s, the latter benefits from
+/// every frame the renderer can produce without wasting a core.
+pub fn display_refresh_rate(hwnd: HWND) -> u32 {
+    unsafe {
+        let hdc = GetDC(hwnd);
+        if hdc == 0 {
+            return 60;
+        }
+        let refresh = GetDeviceCaps(hdc, 116); // VREFRESH
+        ReleaseDC(hwnd, hdc);
+        if refresh < 30 {
+            60
+        } else {
+            (refresh as u32).clamp(30, 360)
+        }
     }
 }
 
@@ -100,14 +135,12 @@ pub fn blit(hdc: HDC, pixmap: &Pixmap) {
         }
         let Some(cache) = slot.as_mut() else { return };
         let src = pixmap.data();
-        let dst = std::slice::from_raw_parts_mut(cache.bits, (w * h * 4) as usize);
-        // RGBA (premultiplied) -> BGRA, which is what a BI_RGB DIB expects.
-        for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-            d[0] = s[2];
-            d[1] = s[1];
-            d[2] = s[0];
-            d[3] = 255;
-        }
+        // The painter keeps its frame in B,G,R,A order, which is exactly the
+        // layout of a 32-bit BI_RGB DIB. A single opaque frame-to-frame copy
+        // replaces the old per-pixel red/blue swizzle (the single most
+        // expensive part of presenting a 1080p or 4K frame).
+        let bytes = (w as usize) * (h as usize) * 4;
+        std::ptr::copy_nonoverlapping(src.as_ptr(), cache.bits, bytes);
         BitBlt(hdc, 0, 0, w, h, cache.mem, 0, 0, SRCCOPY);
     }
 }

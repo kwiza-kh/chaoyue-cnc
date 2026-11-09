@@ -1,6 +1,9 @@
 //! Geometry model for the wire-EDM drawing board.
 
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::{PI, TAU};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Pt {
@@ -138,11 +141,16 @@ pub enum Kind {
 pub struct Entity {
     pub id: u64,
     pub kind: Kind,
+    /// Cached world bounds. Every transform refreshes it, so drawing and
+    /// picking no longer re-evaluate arc trigonometry for each frame or each
+    /// mouse move.
+    bbox: BBox,
 }
 
 impl Entity {
     pub fn new(id: u64, kind: Kind) -> Self {
-        Self { id, kind }
+        let bbox = bbox_of_kind(&kind);
+        Self { id, kind, bbox }
     }
     pub fn start(&self) -> Option<Pt> {
         match &self.kind {
@@ -161,38 +169,10 @@ impl Entity {
         }
     }
     pub fn bbox(&self) -> BBox {
-        match &self.kind {
-            Kind::Point { p } => BBox::new(*p),
-            Kind::Line { a, b } => {
-                let mut bb = BBox::new(*a);
-                bb.union_point(*b);
-                bb
-            }
-            Kind::Circle { c, r } => {
-                let mut bb = BBox::new(Pt::new(c.x - r, c.y - r));
-                bb.union_point(Pt::new(c.x + r, c.y + r));
-                bb
-            }
-            Kind::Arc { c, r, a0, sweep } => {
-                let mut bb = BBox::new(Pt::new(c.x - r, c.y - r));
-                bb.union_point(Pt::new(c.x + r, c.y + r));
-                // Restrict to the actual arc by testing cardinal points.
-                let mut pts = Vec::new();
-                for q in 0..4 {
-                    let a = q as f32 * PI * 0.5;
-                    if angle_on_arc(*a0, *sweep, a) {
-                        pts.push(c.add(Pt::from_angle(a, *r)));
-                    }
-                }
-                pts.push(c.add(Pt::from_angle(*a0, *r)));
-                pts.push(c.add(Pt::from_angle(*a0 + *sweep, *r)));
-                let mut bb = BBox::new(pts[0]);
-                for p in pts {
-                    bb.union_point(p);
-                }
-                bb
-            }
-        }
+        self.bbox
+    }
+    fn refresh_bbox(&mut self) {
+        self.bbox = bbox_of_kind(&self.kind);
     }
     pub fn length(&self) -> f32 {
         match &self.kind {
@@ -289,6 +269,7 @@ impl Entity {
             }
             Kind::Circle { c, .. } | Kind::Arc { c, .. } => *c = c.add(d),
         }
+        self.refresh_bbox();
     }
     pub fn rotate(&mut self, center: Pt, angle: f32) {
         match &mut self.kind {
@@ -303,6 +284,7 @@ impl Entity {
                 *a0 = norm_angle(*a0 + angle);
             }
         }
+        self.refresh_bbox();
     }
     pub fn scale(&mut self, center: Pt, f: f32) {
         match &mut self.kind {
@@ -322,6 +304,7 @@ impl Entity {
                 *r *= f.abs();
             }
         }
+        self.refresh_bbox();
     }
     pub fn mirror(&mut self, p1: Pt, p2: Pt) {
         let reflect = |p: Pt| -> Pt {
@@ -352,6 +335,7 @@ impl Entity {
                 let _ = new_end;
             }
         }
+        self.refresh_bbox();
     }
     pub fn offset(&self, d: f32) -> Option<Kind> {
         match &self.kind {
@@ -371,7 +355,36 @@ impl Entity {
     }
 }
 
-#[derive(Clone, Debug)]
+/// World bounds for one geometric primitive. Arc bounds are exact: only the
+/// cardinal directions actually covered by the sweep are joined to the two
+/// endpoints, so a small arc no longer reports the bounds of its full circle.
+pub fn bbox_of_kind(kind: &Kind) -> BBox {
+    match kind {
+        Kind::Point { p } => BBox::new(*p),
+        Kind::Line { a, b } => {
+            let mut bb = BBox::new(*a);
+            bb.union_point(*b);
+            bb
+        }
+        Kind::Circle { c, r } => BBox {
+            min: Pt::new(c.x - r, c.y - r),
+            max: Pt::new(c.x + r, c.y + r),
+        },
+        Kind::Arc { c, r, a0, sweep } => {
+            let mut bb = BBox::new(c.add(Pt::from_angle(*a0, *r)));
+            bb.union_point(c.add(Pt::from_angle(*a0 + *sweep, *r)));
+            for q in 0..4 {
+                let a = q as f32 * PI * 0.5;
+                if angle_on_arc(*a0, *sweep, a) {
+                    bb.union_point(c.add(Pt::from_angle(a, *r)));
+                }
+            }
+            bb
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Doc {
     pub entities: Vec<Entity>,
     pub next_id: u64,
@@ -380,6 +393,46 @@ pub struct Doc {
     pub unit: String,
     pub programmer: String,
     pub note: String,
+    /// Bumped by every change. The UI uses this O(1) key instead of hashing
+    /// all geometry on every frame.
+    rev: u64,
+    geom_rev: u64,
+    uid: u64,
+    index: RefCell<Option<crate::spatial::SpatialIndex>>,
+    ids: RefCell<Option<HashMap<u64, usize>>>,
+    ids_rev: Cell<u64>,
+    bounds_cache: RefCell<Option<BBox>>,
+    bounds_rev: Cell<u64>,
+}
+
+static NEXT_DOC_UID: AtomicU64 = AtomicU64::new(1);
+
+fn next_doc_uid() -> u64 {
+    NEXT_DOC_UID.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Clone for Doc {
+    fn clone(&self) -> Self {
+        // Undo history clones the document, not its acceleration structures:
+        // an index is rebuilt lazily from the cloned entities on first use.
+        Self {
+            entities: self.entities.clone(),
+            next_id: self.next_id,
+            title: self.title.clone(),
+            part: self.part.clone(),
+            unit: self.unit.clone(),
+            programmer: self.programmer.clone(),
+            note: self.note.clone(),
+            rev: self.rev,
+            geom_rev: self.geom_rev,
+            uid: self.uid,
+            index: RefCell::new(None),
+            ids: RefCell::new(None),
+            ids_rev: Cell::new(0),
+            bounds_cache: RefCell::new(None),
+            bounds_rev: Cell::new(u64::MAX),
+        }
+    }
 }
 
 impl Doc {
@@ -392,7 +445,41 @@ impl Doc {
             unit: "mm".to_string(),
             programmer: String::new(),
             note: String::new(),
+            rev: 1,
+            geom_rev: 1,
+            uid: next_doc_uid(),
+            index: RefCell::new(None),
+            ids: RefCell::new(None),
+            ids_rev: Cell::new(0),
+            bounds_cache: RefCell::new(None),
+            bounds_rev: Cell::new(u64::MAX),
         }
+    }
+
+    /// Identity of this document and its current edit revision. Together they
+    /// are a cheap cache key for rendered layers.
+    pub fn revision(&self) -> u64 {
+        self.rev
+    }
+
+    pub fn uid(&self) -> u64 {
+        self.uid
+    }
+
+    /// Metadata changed (title, part name, note...). Geometry caches stay
+    /// valid; only the rendered layer needs to be rebuilt.
+    pub fn touch(&mut self) {
+        self.rev = self.rev.wrapping_add(1);
+    }
+
+    /// Geometry changed in place (rotate/scale/trim, or a whole document was
+    /// edited outside the add/remove helpers).
+    pub fn touch_geometry(&mut self) {
+        self.rev = self.rev.wrapping_add(1);
+        self.geom_rev = self.geom_rev.wrapping_add(1);
+        *self.index.get_mut() = None;
+        *self.ids.get_mut() = None;
+        self.bounds_rev.set(u64::MAX);
     }
 
     pub fn demo() -> (Self, Vec<u64>) {
@@ -455,46 +542,285 @@ impl Doc {
     pub fn add(&mut self, kind: Kind) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
+        let idx = self.entities.len() as u32;
         self.entities.push(Entity::new(id, kind));
+        let old_geom = self.geom_rev;
+        let index_live = self
+            .index
+            .get_mut()
+            .as_ref()
+            .map(|ix| ix.geom_rev() == old_geom)
+            .unwrap_or(false);
+        self.rev = self.rev.wrapping_add(1);
+        self.geom_rev = self.geom_rev.wrapping_add(1);
+        if index_live {
+            let bb = self.entities[idx as usize].bbox();
+            if let Some(ix) = self.index.get_mut().as_mut() {
+                ix.add_entity(idx, bb);
+                ix.set_geom_rev(self.geom_rev);
+            }
+        }
+        if let Some(map) = self.ids.get_mut() {
+            if self.ids_rev.get() == old_geom {
+                map.insert(id, idx as usize);
+                self.ids_rev.set(self.geom_rev);
+            } else {
+                *self.ids.get_mut() = None;
+            }
+        }
+        self.bounds_rev.set(u64::MAX);
         id
     }
 
     pub fn remove_ids(&mut self, ids: &[u64]) {
-        self.entities.retain(|e| !ids.contains(&e.id));
+        if ids.is_empty() || self.entities.is_empty() {
+            return;
+        }
+        let remove: HashSet<u64> = ids.iter().copied().collect();
+        let before = self.entities.len();
+        self.entities.retain(|e| !remove.contains(&e.id));
+        if self.entities.len() != before {
+            self.touch_geometry();
+        }
     }
 
+    fn ensure_ids(&self) {
+        let valid = self.ids.borrow().is_some() && self.ids_rev.get() == self.geom_rev;
+        if !valid {
+            let map = crate::spatial::build_id_map(&self.entities);
+            *self.ids.borrow_mut() = Some(map);
+            self.ids_rev.set(self.geom_rev);
+        }
+    }
+
+    /// O(1) handle lookup. Previously every call scanned the whole drawing,
+    /// which made queries over a large selection quadratic.
     pub fn get(&self, id: u64) -> Option<&Entity> {
-        self.entities.iter().find(|e| e.id == id)
+        self.ensure_ids();
+        let ids = self.ids.borrow();
+        let idx = ids.as_ref()?.get(&id).copied()?;
+        self.entities.get(idx)
     }
 
     pub fn bounds(&self) -> Option<BBox> {
-        let mut it = self.entities.iter();
-        let first = it.next()?.bbox();
-        let mut bb = first;
-        for e in it {
-            bb.union(e.bbox());
+        if self.bounds_rev.get() == self.geom_rev {
+            return *self.bounds_cache.borrow();
         }
-        Some(bb)
+        let mut it = self.entities.iter();
+        let bb = it.next().map(|e| {
+            let mut bb = e.bbox();
+            for e in it {
+                bb.union(e.bbox());
+            }
+            bb
+        });
+        *self.bounds_cache.borrow_mut() = bb;
+        self.bounds_rev.set(self.geom_rev);
+        bb
+    }
+
+    fn ensure_index(&self) {
+        if self.entities.is_empty() {
+            *self.index.borrow_mut() = None;
+            return;
+        }
+        let valid = self
+            .index
+            .borrow()
+            .as_ref()
+            .map(|ix| ix.geom_rev() == self.geom_rev)
+            .unwrap_or(false);
+        if valid {
+            return;
+        }
+        let bounds = self.bounds().unwrap_or(BBox {
+            min: Pt::new(-1.0, -1.0),
+            max: Pt::new(1.0, 1.0),
+        });
+        let index = crate::spatial::SpatialIndex::build(&self.entities, bounds, self.geom_rev);
+        *self.index.borrow_mut() = Some(index);
+    }
+
+    /// Append ids whose bounds intersect `rect`. Near the cursor this visits
+    /// only a handful of grid cells.
+    pub fn query_rect(&self, rect: BBox, out: &mut Vec<u64>) {
+        self.ensure_index();
+        let index = self.index.borrow();
+        let Some(ix) = index.as_ref() else { return };
+        let mut found = Vec::new();
+        ix.query_indices(rect, &self.entities, &mut found);
+        out.reserve(found.len());
+        for i in found {
+            out.push(self.entities[i as usize].id);
+        }
+    }
+
+    /// Best exact hit within `tol` world units of `p`.
+    pub fn pick(&self, p: Pt, tol: f32) -> Option<u64> {
+        let rect = BBox {
+            min: Pt::new(p.x - tol, p.y - tol),
+            max: Pt::new(p.x + tol, p.y + tol),
+        };
+        self.ensure_index();
+        let index = self.index.borrow();
+        let Some(ix) = index.as_ref() else { return None };
+        let mut found = Vec::new();
+        ix.query_indices(rect, &self.entities, &mut found);
+        let mut best: Option<(f32, u64)> = None;
+        for i in found {
+            let e = &self.entities[i as usize];
+            let d = e.hit(p);
+            if d <= tol && best.as_ref().map(|b| d < b.0).unwrap_or(true) {
+                best = Some((d, e.id));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    /// Move a set of entities and keep the acceleration structures current.
+    /// Dragging a small selection updates only those entries; dragging most of
+    /// a very large drawing falls back to a cheap lazy rebuild.
+    pub fn translate_ids(&mut self, ids: &[u64], d: Pt) {
+        if ids.is_empty() || self.entities.is_empty() {
+            return;
+        }
+        self.ensure_ids();
+        let mut indices: Vec<u32> = Vec::with_capacity(ids.len());
+        {
+            let map = self.ids.borrow();
+            let Some(map) = map.as_ref() else { return };
+            for id in ids {
+                if let Some(&i) = map.get(id) {
+                    indices.push(i as u32);
+                }
+            }
+        }
+        if indices.is_empty() {
+            return;
+        }
+        let old_geom = self.geom_rev;
+        let incremental = indices.len().saturating_mul(4) <= self.entities.len();
+        if incremental {
+            self.ensure_index();
+        }
+        let index_live = incremental
+            && self
+                .index
+                .get_mut()
+                .as_ref()
+                .map(|ix| ix.geom_rev() == old_geom)
+                .unwrap_or(false);
+        for &i in &indices {
+            self.entities[i as usize].translate(d);
+        }
+        self.rev = self.rev.wrapping_add(1);
+        self.geom_rev = self.geom_rev.wrapping_add(1);
+        if index_live {
+            let bboxes: Vec<(u32, BBox)> = indices
+                .iter()
+                .map(|&i| (i, self.entities[i as usize].bbox()))
+                .collect();
+            if let Some(ix) = self.index.get_mut().as_mut() {
+                for (i, bb) in bboxes {
+                    ix.update(i, bb);
+                }
+                ix.set_geom_rev(self.geom_rev);
+            }
+        } else {
+            *self.index.get_mut() = None;
+        }
+        // Entities were not reordered, so an existing handle map stays valid.
+        self.ids_rev.set(self.geom_rev);
+        self.bounds_rev.set(u64::MAX);
     }
 
     pub fn total_length(&self) -> f32 {
         self.entities.iter().map(|e| e.length()).sum()
     }
 
-    pub fn intersections(&self) -> Vec<Pt> {
-        let mut pts = Vec::new();
-        for i in 0..self.entities.len() {
-            if let Kind::Line { a: a1, b: b1 } = self.entities[i].kind {
-                for j in (i + 1)..self.entities.len() {
-                    if let Kind::Line { a: a2, b: b2 } = self.entities[j].kind {
-                        if let Some(p) = segment_intersection(a1, b1, a2, b2) {
-                            pts.push(p);
+    /// Intersections of line entities with their point inside `clip`.
+    /// The old implementation compared every pair; this one only pairs lines
+    /// sharing a grid cell and emits each point in exactly one cell.
+    pub fn intersections_in(&self, clip: BBox) -> Vec<Pt> {
+        let mut out = Vec::new();
+        if self.entities.is_empty() {
+            return out;
+        }
+        self.ensure_index();
+        let index = self.index.borrow();
+        let Some(ix) = index.as_ref() else { return out };
+        let is_line = |i: u32| matches!(self.entities[i as usize].kind, Kind::Line { .. });
+        let line_of = |i: u32| -> Option<(Pt, Pt)> {
+            match &self.entities[i as usize].kind {
+                Kind::Line { a, b } => Some((*a, *b)),
+                _ => None,
+            }
+        };
+        if let Some((c0, r0, c1, r1)) = ix.cells_in(clip) {
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    let cb = ix.cell_bounds(c, r);
+                    let lines: Vec<u32> = ix
+                        .cell(c, r)
+                        .iter()
+                        .copied()
+                        .filter(|&i| {
+                            is_line(i) && self.entities[i as usize].bbox().intersects(&clip)
+                        })
+                        .collect();
+                    for (ia, &a) in lines.iter().enumerate() {
+                        for &b in &lines[ia + 1..] {
+                            let (Some((a1, b1)), Some((a2, b2))) = (line_of(a), line_of(b)) else {
+                                continue;
+                            };
+                            if let Some(p) = segment_intersection(a1, b1, a2, b2) {
+                                if in_cell(&cb, p) && clip.contains(p) {
+                                    out.push(p);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        pts
+        // Entities stored in the overflow set are not present in any cell.
+        let big: Vec<u32> = ix
+            .big()
+            .iter()
+            .copied()
+            .filter(|&i| is_line(i) && self.entities[i as usize].bbox().intersects(&clip))
+            .collect();
+        if !big.is_empty() {
+            let mut candidates = Vec::new();
+            ix.query_indices(clip, &self.entities, &mut candidates);
+            for (ia, &a) in big.iter().enumerate() {
+                for &b in &candidates {
+                    // Other overflow lines are paired once in the big/big loop.
+                    if a == b || big.contains(&b) {
+                        continue;
+                    }
+                    let (Some((a1, b1)), Some((a2, b2))) = (line_of(a), line_of(b)) else {
+                        continue;
+                    };
+                    if let Some(p) = segment_intersection(a1, b1, a2, b2) {
+                        if clip.contains(p) {
+                            out.push(p);
+                        }
+                    }
+                }
+                for &b in &big[ia + 1..] {
+                    let (Some((a1, b1)), Some((a2, b2))) = (line_of(a), line_of(b)) else {
+                        continue;
+                    };
+                    if let Some(p) = segment_intersection(a1, b1, a2, b2) {
+                        if clip.contains(p) {
+                            out.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub fn all_ids(&self) -> Vec<u64> {
@@ -587,8 +913,19 @@ impl Doc {
     }
 }
 
-pub fn segment_intersection(a1: Pt, b1: Pt, a2: Pt, b2: Pt) -> Option<Pt> {
-    let r = b1.sub(a1);
+/// A grid cell owns its left/bottom edge and, at the drawing's outer edge,
+/// its right/top edge too. Intersections exactly on an internal cell border can
+/// therefore be reported by both neighbouring cells; that is harmless for a
+/// snap or a node marker and avoids missing a boundary point.
+fn in_cell(cell: &BBox, p: Pt) -> bool {
+    let eps = 1e-4;
+    p.x >= cell.min.x - eps
+        && p.x <= cell.max.x + eps
+        && p.y >= cell.min.y - eps
+        && p.y <= cell.max.y + eps
+}
+
+pub fn segment_intersection(a1: Pt, b1: Pt, a2: Pt, b2: Pt) -> Option<Pt> {    let r = b1.sub(a1);
     let s = b2.sub(a2);
     let denom = r.x * s.y - r.y * s.x;
     if denom.abs() < 1e-9 {

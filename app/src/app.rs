@@ -229,6 +229,10 @@ pub struct CodeState {
     scroll: f32,
     font: f32,
     summary: String,
+    /// Byte ranges of the lines in `text`, computed once when the dialog
+    /// opens. Re-splitting and re-skipping the whole program every frame made
+    /// long programs expensive to scroll.
+    line_starts: Vec<(u32, u32)>,
 }
 
 #[derive(Clone)]
@@ -338,6 +342,30 @@ struct StaticCache {
     cx_bits: u32,
     cy_bits: u32,
     signature: u64,
+    pixmap: Pixmap,
+}
+
+struct BaseCache {
+    w: u32,
+    h: u32,
+    scale_bits: u32,
+    cx_bits: u32,
+    cy_bits: u32,
+    bg: u8,
+    grid: bool,
+    signature: u64,
+    pixmap: Pixmap,
+}
+
+/// The dimmed drawing board and chrome behind a modal dialog. Blending a
+/// full-window translucent layer for every dialog frame was the main reason
+/// option clicks and code-page scrolling felt heavy, especially at 1440p/4K.
+/// The scene behind a dialog cannot change while it is open, so compose it
+/// once and reuse it until the dialog closes (or the window is resized).
+struct DialogBackdrop {
+    w: u32,
+    h: u32,
+    key: u64,
     pixmap: Pixmap,
 }
 
@@ -504,6 +532,12 @@ pub struct App {
     pub canvas: Rect,
     pub input_rect: Rect,
     pub code_area: Option<Rect>,
+    /// Scrollbar / wheel geometry for the code page, captured while painting.
+    code_panel: Option<Rect>,
+    code_track: Option<Rect>,
+    code_thumb: Option<Rect>,
+    code_scroll_max: f32,
+    code_drag: Option<f32>,
     pub ortho: bool,
     pub polar: bool,
     pub osnap: bool,
@@ -516,15 +550,28 @@ pub struct App {
     pub cursor: CursorKind,
     background_cache: Option<CanvasCache>,
     static_cache: Option<StaticCache>,
+    base_cache: Option<BaseCache>,
+    /// Drawing without the entities being dragged, built once at drag start.
+    drag_base: Option<Pixmap>,
+    dialog_backdrop: Option<DialogBackdrop>,
     pub profile: bool,
     profile_frames: u32,
+    /// Monotonic counter for cached layers. It changes whenever the cut path
+    /// or another non-document overlay changes, so the renderer can avoid
+    /// hashing all geometry every frame.
+    scene_rev: u64,
+    /// Live-frame diagnostics for --bench-input; harmless during normal use.
+    pub perf_input_events: u64,
+    pub perf_paints: u64,
+    pub perf_max_gap_ms: f64,
+    pub perf_last_paint: Option<std::time::Instant>,
 }
 
 const TIPS: [&str; 7] = [
     "先画出封闭轮廓，再选择图元，就可以在“编程”菜单里生成切割路径。",
     "滚轮可以缩放图板，按住鼠标中键拖动可以平移视图。",
     "按 F8 切换正交，按 F9 切换对象捕捉，按 F7 切换网格。",
-    "在下方命令栏输入坐标（例如 20,15）同样可以确定点位。",
+    "在下方命令栏输入坐标（例如 20,15）或命令（例如 line、直线、foam），输入 ? 查看命令列表。",
     "切割编程支持 3B、ISO G 代码和 Mach3 G 代码，生成后可以先做代码校验再存盘。",
     "泡沫切割在“编程 → 泡沫切割 (Mach3)”中，F5 可直接打开；两轴或四轴 XYAB 均可输出。",
     "设置中的工时计算指数与单价，用来估算加工面积、工时和金额。",
@@ -576,6 +623,11 @@ impl App {
             canvas: Rect::new(38.0, 66.0, 1284.0, 742.0),
             input_rect: Rect::new(38.0, 808.0, 1284.0, 26.0),
             code_area: None,
+            code_panel: None,
+            code_track: None,
+            code_thumb: None,
+            code_scroll_max: 0.0,
+            code_drag: None,
             ortho: false,
             polar: false,
             osnap: true,
@@ -588,8 +640,16 @@ impl App {
             cursor: CursorKind::Arrow,
             background_cache: None,
             static_cache: None,
+            base_cache: None,
+            drag_base: None,
+            dialog_backdrop: None,
             profile: false,
             profile_frames: 0,
+            scene_rev: 1,
+            perf_input_events: 0,
+            perf_paints: 0,
+            perf_max_gap_ms: 0.0,
+            perf_last_paint: None,
         }
     }
 
@@ -634,6 +694,18 @@ impl App {
         )
     }
 
+    /// World rectangle covered by the board, plus a screen-space margin so
+    /// strokes whose bounds just touch the edge are not clipped early.
+    fn visible_world(&self, margin: f32) -> BBox {
+        let a = self.screen_to_world(self.canvas.x, self.canvas.bottom());
+        let b = self.screen_to_world(self.canvas.right(), self.canvas.y);
+        let m = margin / self.scale.max(0.0001);
+        BBox {
+            min: Pt::new(a.x.min(b.x) - m, a.y.min(b.y) - m),
+            max: Pt::new(a.x.max(b.x) + m, a.y.max(b.y) + m),
+        }
+    }
+
     fn fit_view(&mut self) {
         let bb = self.doc.bounds().unwrap_or(BBox {
             min: Pt::new(-100.0, -70.0),
@@ -676,18 +748,10 @@ impl App {
 
     fn hit_entity(&self, p: Pt, tol_screen: f32) -> Option<u64> {
         let tol = tol_screen / self.scale;
-        let mut best: Option<(f32, u64)> = None;
-        for e in &self.doc.entities {
-            // A cheap bounds test makes hit-testing independent of drawing size.
-            if !e.bbox().expand(tol).contains(p) {
-                continue;
-            }
-            let d = e.hit(p);
-            if d <= tol && best.as_ref().map(|b| d < b.0).unwrap_or(true) {
-                best = Some((d, e.id));
-            }
-        }
-        best.map(|b| b.1)
+        // The spatial grid narrows the exact distance test to the few entities
+        // under the cursor; a 100k-segment import no longer turns each mouse
+        // message into a full-drawing scan.
+        self.doc.pick(p, tol)
     }
 
     fn snap_mode_point(&self, e: &crate::model::Entity) -> Vec<(Pt, u8)> {
@@ -706,8 +770,18 @@ impl App {
     fn snap_world(&self, sx: f32, sy: f32) -> (Pt, bool) {
         let raw = self.screen_to_world(sx, sy);
         if self.osnap {
+            // All snap candidates live within ten screen pixels of the cursor.
+            // Query that small world rectangle once and reuse it for every mode.
+            let tol = 10.0 / self.scale;
+            let area = BBox {
+                min: Pt::new(raw.x - tol, raw.y - tol),
+                max: Pt::new(raw.x + tol, raw.y + tol),
+            };
+            let mut candidates = Vec::new();
+            self.doc.query_rect(area, &mut candidates);
             let mut best: Option<(f32, Pt)> = None;
-            for e in &self.doc.entities {
+            for id in &candidates {
+                let Some(e) = self.doc.get(*id) else { continue };
                 for (p, mode) in self.snap_mode_point(e) {
                     if self.snap_modes & mode == 0 {
                         continue;
@@ -720,7 +794,10 @@ impl App {
                 }
             }
             if self.snap_modes & 8 != 0 {
-                for p in self.doc.intersections() {
+                // Only intersections of lines near the cursor are relevant;
+                // the old path compared every line with every other line on
+                // each mouse move.
+                for p in self.doc.intersections_in(area) {
                     let s = self.w2s(p);
                     let d = ((s.0 - sx).powi(2) + (s.1 - sy).powi(2)).sqrt();
                     if d < 10.0 && best.as_ref().map(|b| d < b.0).unwrap_or(true) {
@@ -729,10 +806,10 @@ impl App {
                 }
             }
             if self.snap_modes & 16 != 0 {
-                // Exact nearest point on each entity instead of sampling a
-                // circle around the cursor; this is both faster and accurate
-                // when zoomed in.
-                for e in &self.doc.entities {
+                // Exact nearest point on the nearby entities instead of
+                // sampling a circle around the cursor.
+                for id in &candidates {
+                    let Some(e) = self.doc.get(*id) else { continue };
                     let (q, _) = e.nearest_point(raw);
                     let s = self.w2s(q);
                     let d = ((s.0 - sx).powi(2) + (s.1 - sy).powi(2)).sqrt();
@@ -854,6 +931,7 @@ impl App {
     fn reset_tool_state(&mut self) {
         self.pts.clear();
         self.drag = None;
+        self.drag_base = None;
     }
 
     fn set_tool(&mut self, t: Tool) {
@@ -874,13 +952,21 @@ impl App {
         self.dirty = true;
     }
 
+    /// Cut-path overlays participate in the cached canvas, so changing one has
+    /// to invalidate that canvas. Routing every assignment through here keeps
+    /// the cache valid without re-hashing the path on each frame.
+    fn set_cut_job(&mut self, job: Option<CutJob>) {
+        self.cut_job = job;
+        self.scene_rev = self.scene_rev.wrapping_add(1);
+    }
+
     fn undo(&mut self) {
         if let Some(prev) = self.undo.pop() {
             self.redo.push(self.doc.clone());
             self.doc = prev;
             self.selected.clear();
             self.dirty = true;
-            self.cut_job = None;
+            self.set_cut_job(None);
             self.last_code = None;
             self.status = "已撤销上一步操作".to_string();
         }
@@ -892,7 +978,7 @@ impl App {
             self.doc = next;
             self.selected.clear();
             self.dirty = true;
-            self.cut_job = None;
+            self.set_cut_job(None);
             self.last_code = None;
             self.status = "已重做".to_string();
         }
@@ -905,6 +991,21 @@ impl App {
             return;
         }
         self.mouse = (x, y);
+        if let Some(grab) = self.code_drag {
+            if matches!(self.dialog, Some(Dialog::Code(_))) {
+                self.mouse_in_canvas = false;
+                if let (Some(track), Some(thumb)) = (self.code_track, self.code_thumb) {
+                    let travel = (track.h - thumb.h).max(1.0);
+                    let frac = ((y - grab - track.y) / travel).clamp(0.0, 1.0);
+                    let max = self.code_scroll_max;
+                    if let Some(Dialog::Code(st)) = &mut self.dialog {
+                        st.scroll = frac * max;
+                    }
+                }
+                return;
+            }
+            self.code_drag = None;
+        }
         self.mouse_in_canvas = self.canvas.contains(x, y) && self.dialog.is_none() && self.menu_open.is_none();
         if self.menu_open.is_some() {
             if let Some((_, idx)) = self
@@ -933,15 +1034,17 @@ impl App {
                         let total = p.sub(*start);
                         if !*moved && total.len() * self.scale > 2.0 {
                             *moved = true;
+                            // One-time snapshot without the moving entities.
+                            // Every following drag frame composites this layer
+                            // and strokes only the selection.
+                            if self.drag_base.is_none() {
+                                self.drag_base = self.build_static_layer_excluding(ids);
+                            }
                         }
                         if *moved {
                             let delta = total.sub(*applied);
                             if delta.len() > 1e-9 {
-                                for e in &mut self.doc.entities {
-                                    if ids.contains(&e.id) {
-                                        e.translate(delta);
-                                    }
-                                }
+                                self.doc.translate_ids(ids, delta);
                                 *applied = total;
                                 self.dirty = true;
                             }
@@ -988,6 +1091,34 @@ impl App {
         self.mouse = (x, y);
         self.left_down = true;
         if self.dialog.is_some() {
+            if matches!(self.dialog, Some(Dialog::Code(_))) {
+                if let Some(track) = self.code_track {
+                    if track.w > 0.0 && track.contains(x, y) {
+                        let thumb = self.code_thumb;
+                        if let Some(t) = thumb {
+                            let grab = Rect::new(t.x - 3.0, t.y, t.w + 6.0, t.h);
+                            if grab.contains(x, y) {
+                                self.code_drag = Some((y - t.y).clamp(0.0, t.h));
+                                return;
+                            }
+                        }
+                        // Clicking the empty part of the track pages toward
+                        // the click, like a normal scrollbar.
+                        let page = self.code_area.map(|a| a.h * 0.9).unwrap_or(320.0);
+                        let max = self.code_scroll_max;
+                        let current = match &self.dialog {
+                            Some(Dialog::Code(st)) => st.scroll,
+                            _ => 0.0,
+                        };
+                        let up = thumb.map(|t| y < t.y).unwrap_or(true);
+                        let next = if up { current - page } else { current + page };
+                        if let Some(Dialog::Code(st)) = &mut self.dialog {
+                            st.scroll = next.clamp(0.0, max);
+                        }
+                        return;
+                    }
+                }
+            }
             if let Some((_, act)) = self
                 .dialog_hits
                 .iter()
@@ -1038,6 +1169,8 @@ impl App {
     pub fn on_left_up(&mut self, x: f32, y: f32) {
         self.left_down = false;
         self.mouse = (x, y);
+        self.code_drag = None;
+        self.drag_base = None;
         let drag = self.drag.take();
         match drag {
             Some(Drag::Move { snapshot, ids, moved, .. }) => {
@@ -1060,11 +1193,7 @@ impl App {
                 };
                 if (current.0 - start.0).abs() > 4.0 || (current.1 - start.1).abs() > 4.0 {
                     let mut ids = Vec::new();
-                    for e in &self.doc.entities {
-                        if e.bbox().intersects(&bb) {
-                            ids.push(e.id);
-                        }
-                    }
+                    self.doc.query_rect(bb, &mut ids);
                     self.selected = ids;
                     self.status = format!("已选择 {} 个图元", self.selected.len());
                 } else {
@@ -1132,12 +1261,19 @@ impl App {
     }
 
     pub fn on_wheel(&mut self, x: f32, y: f32, delta: i32) {
-        if let Some(Dialog::Code(st)) = &mut self.dialog {
-            if self.code_area.map(|r| r.contains(x, y)).unwrap_or(false) {
-                st.scroll -= delta as f32 * 0.5;
-                st.scroll = st.scroll.max(0.0);
-                return;
+        if matches!(self.dialog, Some(Dialog::Code(_)))
+            && self.code_panel.map(|r| r.contains(x, y)).unwrap_or(false)
+        {
+            let max = self.code_scroll_max;
+            if let Some(Dialog::Code(st)) = &mut self.dialog {
+                // Three text lines per wheel notch, but keep fractional pixel
+                // steps so a precision touchpad scrolls as smoothly as it
+                // moves. A wheel event anywhere over the dialog (not only the
+                // narrow code strip) scrolls the page.
+                let px = st.font * 1.5 * 3.0 * (delta as f32 / 120.0);
+                st.scroll = (st.scroll - px).clamp(0.0, max);
             }
+            return;
         }
         if self.canvas.contains(x, y) && self.dialog.is_none() {
             let steps = delta as f32 / 120.0;
@@ -1151,6 +1287,10 @@ impl App {
         const VK_BACK: u32 = 8;
         const VK_RETURN: u32 = 13;
         const VK_ESCAPE: u32 = 27;
+        const VK_END: u32 = 35;
+        const VK_HOME: u32 = 36;
+        const VK_UP: u32 = 38;
+        const VK_DOWN: u32 = 40;
         const VK_PRIOR: u32 = 33;
         const VK_NEXT: u32 = 34;
         const VK_DELETE: u32 = 46;
@@ -1159,6 +1299,48 @@ impl App {
         const VK_F8: u32 = 119;
         const VK_F9: u32 = 120;
         const VK_F10: u32 = 121;
+        if self.dialog.is_some() {
+            // A modal owns the keyboard. Global shortcuts must not change the
+            // drawing (or the board behind the dimmed layer) while it is open.
+            match vk {
+                VK_ESCAPE => {
+                    self.close_dialog();
+                    return;
+                }
+                VK_RETURN => {
+                    self.on_dialog_confirm();
+                    return;
+                }
+                VK_BACK => {
+                    self.backspace_field();
+                    return;
+                }
+                _ => {}
+            }
+            if matches!(self.dialog, Some(Dialog::Code(_))) {
+                let (cur, line_h) = match &self.dialog {
+                    Some(Dialog::Code(s)) => (s.scroll, s.font * 1.5),
+                    _ => (0.0, 19.5),
+                };
+                let page = self.code_area.map(|a| a.h * 0.9).unwrap_or(320.0).max(60.0);
+                let max = self.code_scroll_max;
+                let next = match vk {
+                    VK_PRIOR => Some(cur - page),
+                    VK_NEXT => Some(cur + page),
+                    VK_HOME => Some(0.0),
+                    VK_END => Some(max),
+                    VK_UP => Some(cur - line_h),
+                    VK_DOWN => Some(cur + line_h),
+                    _ => None,
+                };
+                if let Some(v) = next {
+                    if let Some(Dialog::Code(s)) = &mut self.dialog {
+                        s.scroll = v.clamp(0.0, max);
+                    }
+                }
+            }
+            return;
+        }
         if ctrl {
             match vk {
                 65 => self.do_act(Act::SelectAll),          // A
@@ -1179,9 +1361,7 @@ impl App {
         }
         match vk {
             VK_ESCAPE => {
-                if self.dialog.is_some() {
-                    self.close_dialog();
-                } else if self.menu_open.is_some() {
+                if self.menu_open.is_some() {
                     self.menu_open = None;
                 } else if self.tool != Tool::Select || !self.pts.is_empty() {
                     self.reset_tool_state();
@@ -1193,38 +1373,20 @@ impl App {
                 }
             }
             VK_RETURN => {
-                if self.dialog.is_some() {
-                    self.on_dialog_confirm();
-                } else if self.tool == Tool::Polyline {
+                if self.tool == Tool::Polyline {
                     self.finish_polyline(false);
                 } else {
                     self.submit_command();
                 }
             }
             VK_BACK => {
-                if self.dialog.is_some() {
-                    self.backspace_field();
-                } else {
-                    self.command.pop();
-                }
+                self.command.pop();
             }
             VK_DELETE => {
-                if self.dialog.is_none() {
-                    self.delete_selected();
-                }
-            }
-            VK_PRIOR | VK_NEXT => {
-                if let Some(Dialog::Code(s)) = &mut self.dialog {
-                    let page = 320.0;
-                    if vk == VK_PRIOR {
-                        s.scroll = (s.scroll - page).max(0.0);
-                    } else {
-                        s.scroll += page;
-                    }
-                }
+                self.delete_selected();
             }
             VK_F5 => {
-                if self.dialog.is_none() && self.menu_open.is_none() {
+                if self.menu_open.is_none() {
                     self.do_act(Act::FoamProgram);
                 }
             }
@@ -1394,13 +1556,7 @@ impl App {
                     let d = self.pts[1].sub(self.pts[0]);
                     self.push_undo();
                     let mut new_ids = Vec::new();
-                    let src: Vec<crate::model::Entity> = self
-                        .doc
-                        .entities
-                        .iter()
-                        .filter(|e| self.selected.contains(&e.id))
-                        .cloned()
-                        .collect();
+                    let src = self.selected_entities();
                     for e in src {
                         let mut k = e.kind.clone();
                         let mut ent = crate::model::Entity::new(0, k.clone());
@@ -1424,13 +1580,7 @@ impl App {
                     let p2 = self.pts[1];
                     let mut new_ids = Vec::new();
                     self.push_undo();
-                    let src: Vec<crate::model::Entity> = self
-                        .doc
-                        .entities
-                        .iter()
-                        .filter(|e| self.selected.contains(&e.id))
-                        .cloned()
-                        .collect();
+                    let src = self.selected_entities();
                     for e in src {
                         let mut ent = crate::model::Entity::new(0, e.kind.clone());
                         ent.mirror(p1, p2);
@@ -1454,11 +1604,14 @@ impl App {
                     let a1 = self.pts[2].sub(c).angle();
                     let ang = a1 - a0;
                     self.push_undo();
+                    let sel: std::collections::HashSet<u64> =
+                        self.selected.iter().copied().collect();
                     for e in &mut self.doc.entities {
-                        if self.selected.contains(&e.id) {
+                        if sel.contains(&e.id) {
                             e.rotate(c, ang);
                         }
                     }
+                    self.doc.touch_geometry();
                     self.pts.clear();
                     self.status = format!("已旋转 {:.2}°", ang * 180.0 / std::f32::consts::PI);
                 }
@@ -1581,7 +1734,7 @@ impl App {
         let ids = self.selected.clone();
         self.doc.remove_ids(&ids);
         self.selected.clear();
-        self.cut_job = None;
+        self.set_cut_job(None);
         self.last_code = None;
         self.status = "已删除图元".to_string();
     }
@@ -1671,8 +1824,20 @@ impl App {
                 return;
             }
         }
+        // Named commands come from the shared command table, so the command
+        // bar and future menu entries use the same registry.
+        if let Some(cmd) = crate::commands::find(&cleaned) {
+            self.command.clear();
+            self.do_act(cmd.act);
+            return;
+        }
+        if cleaned == "?" || cleaned.eq_ignore_ascii_case("help") {
+            self.command.clear();
+            self.open_message("命令列表", &crate::commands::help_text(), false);
+            return;
+        }
         self.command.clear();
-        self.status = "请输入坐标，例如 20,15".to_string();
+        self.status = "请输入坐标（如 20,15）或命令（输入 ? 查看列表）".to_string();
     }
 
     // ---------- menus / actions ----------
@@ -1782,7 +1947,7 @@ impl App {
             Act::CodeSave => self.save_code(),
             Act::CodeTransfer => self.open_transfer(),
             Act::DeleteCut => {
-                self.cut_job = None;
+                self.set_cut_job(None);
                 self.last_code = None;
                 self.status = "已删除切割路径".to_string();
                 self.menu_open = None;
@@ -1855,10 +2020,11 @@ impl App {
                         self.doc.part = stem;
                     }
                 }
+                self.doc.touch();
                 self.path = None;
                 self.dirty = true;
                 self.fitted = false;
-                self.cut_job = None;
+                self.set_cut_job(None);
                 self.last_code = None;
                 self.selected.clear();
                 self.status = format!("已从 DXF 导入 {} 个图元", count);
@@ -1923,7 +2089,7 @@ impl App {
         self.path = None;
         self.dirty = false;
         self.selected.clear();
-        self.cut_job = None;
+        self.set_cut_job(None);
         self.last_code = None;
         self.undo.clear();
         self.redo.clear();
@@ -1947,7 +2113,7 @@ impl App {
                     self.path = Some(path.clone());
                     self.dirty = false;
                     self.selected.clear();
-                    self.cut_job = None;
+                    self.set_cut_job(None);
                     self.last_code = None;
                     self.undo.clear();
                     self.redo.clear();
@@ -1989,6 +2155,7 @@ impl App {
                 self.path = Some(path.to_path_buf());
                 if let Some(name) = path.file_name() {
                     self.doc.title = name.to_string_lossy().to_string();
+                    self.doc.touch();
                 }
                 self.dirty = false;
                 self.status = format!("已保存到 {}", path.display());
@@ -2087,7 +2254,7 @@ impl App {
         };
         if let Ok(mut out) = generate(&self.doc, &ids, &opt) {
             out.path_count = out.job.paths.len();
-            self.cut_job = Some(out.job.clone());
+            self.set_cut_job(Some(out.job.clone()));
             self.last_code = Some(out);
         }
     }
@@ -2135,6 +2302,16 @@ impl App {
         } else {
             self.selected.clone()
         }
+    }
+
+    /// A snapshot of the selected entities in O(selection) rather than
+    /// scanning the whole document for each selected handle.
+    fn selected_entities(&self) -> Vec<crate::model::Entity> {
+        self.selected
+            .iter()
+            .filter_map(|id| self.doc.get(*id))
+            .cloned()
+            .collect()
     }
 
     fn open_cut_dialog(&mut self) {
@@ -2194,7 +2371,7 @@ impl App {
         match generate(&self.doc, &ids, &opt) {
             Ok(mut out) => {
                 out.path_count = out.job.paths.len();
-                self.cut_job = Some(out.job.clone());
+                self.set_cut_job(Some(out.job.clone()));
                 self.settings.code_kind = kind;
                 self.settings.save();
                 self.last_code = Some(out);
@@ -2293,7 +2470,7 @@ impl App {
                     path_count,
                     extra: out.extra,
                 };
-                self.cut_job = Some(code.job.clone());
+                self.set_cut_job(Some(code.job.clone()));
                 self.last_code = Some(code);
                 self.settings.foam_four_axis = st.mode == 1;
                 self.settings.foam_side = st.side;
@@ -2348,9 +2525,12 @@ impl App {
             scroll: 0.0,
             font: 13.0,
             summary,
+            line_starts: code_line_ranges(&code.text),
         }));
         self.focus = None;
         self.menu_open = None;
+        self.code_drag = None;
+        self.code_scroll_max = 0.0;
     }
 
     fn save_code(&mut self) {
@@ -2508,13 +2688,7 @@ impl App {
             return;
         }
         self.push_undo();
-        let src: Vec<crate::model::Entity> = self
-            .doc
-            .entities
-            .iter()
-            .filter(|e| self.selected.contains(&e.id))
-            .cloned()
-            .collect();
+        let src = self.selected_entities();
         let mut new_ids = Vec::new();
         for r in 0..rows {
             for c in 0..cols {
@@ -2572,13 +2746,7 @@ impl App {
         match st.action {
             PromptAct::Offset => {
                 self.push_undo();
-                let src: Vec<crate::model::Entity> = self
-                    .doc
-                    .entities
-                    .iter()
-                    .filter(|e| self.selected.contains(&e.id))
-                    .cloned()
-                    .collect();
+                let src = self.selected_entities();
                 let mut new_ids = Vec::new();
                 for e in src {
                     if let Some(k) = e.offset(v) {
@@ -2607,11 +2775,14 @@ impl App {
                 let Some(bb) = bb else { return };
                 let c = bb.center();
                 self.push_undo();
+                let sel: std::collections::HashSet<u64> =
+                    self.selected.iter().copied().collect();
                 for e in &mut self.doc.entities {
-                    if self.selected.contains(&e.id) {
+                    if sel.contains(&e.id) {
                         e.scale(c, v);
                     }
                 }
+                self.doc.touch_geometry();
                 self.status = format!("已缩放 {:.3} 倍", v);
             }
         }
@@ -2626,6 +2797,11 @@ impl App {
         self.field_selected = false;
         self.field_hits.clear();
         self.dialog_hits.clear();
+        self.dialog_backdrop = None;
+        self.code_panel = None;
+        self.code_track = None;
+        self.code_thumb = None;
+        self.code_drag = None;
     }
 
     fn on_dialog_act(&mut self, act: Act) {
@@ -2820,6 +2996,7 @@ impl App {
                     self.doc.unit = st.unit.trim().to_string();
                     self.doc.programmer = st.programmer.trim().to_string();
                     self.doc.note = st.note.trim().to_string();
+                    self.doc.touch();
                     self.dirty = true;
                     self.close_dialog();
                     self.status = "图形信息已更新".to_string();
@@ -2947,10 +3124,39 @@ impl App {
             self.fitted = true;
         }
         let t0 = std::time::Instant::now();
-        self.draw_canvas();
-        let t1 = std::time::Instant::now();
-        self.draw_chrome();
-        let t2 = std::time::Instant::now();
+        let dialog_open = self.dialog.is_some();
+        let backdrop_key = if dialog_open { Some(self.dialog_backdrop_key()) } else { None };
+        let backdrop_hit = backdrop_key
+            .map(|k| {
+                self.dialog_backdrop
+                    .as_ref()
+                    .map(|b| b.w == w && b.h == h && b.key == k)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if backdrop_hit {
+            // The scene behind a modal cannot change; restore the cached
+            // dimmed frame with one memory copy instead of repainting the
+            // whole board and blending a translucent layer again.
+            if let Some(b) = &self.dialog_backdrop {
+                self.painter.copy_pixmap_at(0, 0, &b.pixmap);
+            }
+        } else {
+            self.draw_canvas();
+            let t1 = std::time::Instant::now();
+            self.draw_chrome();
+            let t2 = std::time::Instant::now();
+            if let Some(key) = backdrop_key {
+                self.build_dialog_backdrop(key);
+            }
+            if self.profile && self.profile_frames < 4 {
+                eprintln!(
+                    "render profile: canvas {:.1} ms, chrome {:.1} ms (dialog backdrop rebuilt)",
+                    (t1 - t0).as_secs_f64() * 1000.0,
+                    (t2 - t1).as_secs_f64() * 1000.0
+                );
+            }
+        }
         if self.menu_open.is_some() && self.dialog.is_none() {
             self.draw_dropdown();
         }
@@ -2963,10 +3169,7 @@ impl App {
         let t3 = std::time::Instant::now();
         if self.profile && self.profile_frames < 4 {
             eprintln!(
-                "render profile: canvas {:.1} ms, chrome {:.1} ms, overlays {:.1} ms, total {:.1} ms",
-                (t1 - t0).as_secs_f64() * 1000.0,
-                (t2 - t1).as_secs_f64() * 1000.0,
-                (t3 - t2).as_secs_f64() * 1000.0,
+                "render profile: total {:.1} ms",
                 (t3 - t0).as_secs_f64() * 1000.0
             );
             self.profile_frames += 1;
@@ -2987,6 +3190,78 @@ impl App {
             self.title_cache = title.clone();
             platform::set_title(self.hwnd, &title);
         }
+    }
+
+    /// The code page's scroll position, for interactive tests and diagnostics.
+    pub fn code_scroll_value(&self) -> Option<f32> {
+        match &self.dialog {
+            Some(Dialog::Code(st)) => Some(st.scroll),
+            _ => None,
+        }
+    }
+
+    pub fn code_scroll_limit(&self) -> f32 {
+        self.code_scroll_max
+    }
+
+    pub fn code_page_area(&self) -> Option<Rect> {
+        self.code_area
+    }
+
+    pub fn code_scroll_track(&self) -> Option<Rect> {
+        self.code_track
+    }
+
+    pub fn code_scroll_thumb(&self) -> Option<Rect> {
+        self.code_thumb
+    }
+
+    /// A compact fingerprint of everything the dimmed backdrop shows. While a
+    /// dialog is open the board, chrome layout, status line and theme cannot
+    /// change through normal input, so this is stable from frame to frame.
+    fn dialog_backdrop_key(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.w.hash(&mut h);
+        self.h.hash(&mut h);
+        self.status.hash(&mut h);
+        self.command.hash(&mut h);
+        self.menu_open.hash(&mut h);
+        self.settings.bg.hash(&mut h);
+        self.settings.show_center.hash(&mut h);
+        self.settings.show_node.hash(&mut h);
+        self.settings.show_cut.hash(&mut h);
+        self.grid.hash(&mut h);
+        self.ortho.hash(&mut h);
+        self.polar.hash(&mut h);
+        self.osnap.hash(&mut h);
+        self.snap_modes.hash(&mut h);
+        self.dirty.hash(&mut h);
+        h.finish()
+    }
+
+    fn build_dialog_backdrop(&mut self, key: u64) {
+        let w = self.painter.pixmap.width();
+        let h = self.painter.pixmap.height();
+        if w == 0 || h == 0 {
+            return;
+        }
+        let Some(mut dim) = Pixmap::new(w, h) else { return };
+        dim.data_mut().copy_from_slice(self.painter.pixmap.data());
+        let mut dimmed = crate::gfx::Painter { pixmap: dim };
+        dimmed.fill_rect(
+            Rect::new(0.0, 0.0, w as f32, h as f32),
+            Color::rgba(8, 14, 22, 120),
+        );
+        dim = dimmed.pixmap;
+        self.painter.copy_pixmap_at(0, 0, &dim);
+        self.dialog_backdrop = Some(DialogBackdrop {
+            w,
+            h,
+            key,
+            pixmap: dim,
+        });
     }
 
     fn canvas_palette(&self) -> (Color, Color, Color, Color, Color, Color) {
@@ -3060,64 +3335,189 @@ impl App {
                 pixmap,
             });
         }
-        if let Some(cc) = &self.background_cache {
-            self.painter
-                .copy_pixmap_at(c.x.round() as i32, c.y.round() as i32, &cc.pixmap);
-        }
-
         // Static content (geometry, nodes, cut path, title block) is cached and
         // only rebuilt when the drawing or view changes. Hover/selection/mouse
         // feedback is drawn on top, so moving the crosshair costs one cached
         // blit plus a few overlays instead of re-stroking every entity.
-        let signature = self.static_signature();
-        let static_valid = self
-            .static_cache
-            .as_ref()
-            .map(|sc| {
-                sc.w == cw
-                    && sc.h == ch
-                    && sc.scale_bits == scale_bits
-                    && sc.cx_bits == cx_bits
-                    && sc.cy_bits == cy_bits
-                    && sc.signature == signature
+        //
+        // While a middle-mouse pan is active we shift the last composed frame
+        // instead of re-rasterizing the drawing, so panning a dense import
+        // stays smooth. On release the cache key changes and one precise frame
+        // is built.
+        let pan_shift = if matches!(self.drag, Some(Drag::Pan { .. })) {
+            self.base_cache.as_ref().and_then(|bc| {
+                if bc.w == cw
+                    && bc.h == ch
+                    && bc.scale_bits == scale_bits
+                    && bc.bg == self.settings.bg
+                    && bc.grid == self.grid
+                {
+                    let old_cx = f32::from_bits(bc.cx_bits);
+                    let old_cy = f32::from_bits(bc.cy_bits);
+                    Some((
+                        ((old_cx - self.view_center.x) * self.scale).round() as i32,
+                        ((self.view_center.y - old_cy) * self.scale).round() as i32,
+                    ))
+                } else {
+                    None
+                }
             })
-            .unwrap_or(false);
-        if !static_valid {
-            if let Some(pixmap) = self.build_static_layer() {
-                self.static_cache = Some(StaticCache {
-                    w: cw,
-                    h: ch,
-                    scale_bits,
-                    cx_bits,
-                    cy_bits,
-                    signature,
-                    pixmap,
-                });
+        } else {
+            None
+        };
+        let drag_fast = matches!(self.drag, Some(Drag::Move { .. }))
+            && self.drag_base.is_some()
+            && self
+                .background_cache
+                .as_ref()
+                .map(|cc| {
+                    cc.w == cw
+                        && cc.h == ch
+                        && cc.scale_bits == scale_bits
+                        && cc.cx_bits == cx_bits
+                        && cc.cy_bits == cy_bits
+                        && cc.bg == self.settings.bg
+                        && cc.grid == self.grid
+                })
+                .unwrap_or(false);
+        if let Some((dx, dy)) = pan_shift {
+            self.painter.fill_rect(c, bg);
+            if let Some(bc) = &self.base_cache {
+                self.painter.copy_pixmap_at(
+                    c.x.round() as i32 + dx,
+                    c.y.round() as i32 + dy,
+                    &bc.pixmap,
+                );
             }
-        }
-        if let Some(sc) = &self.static_cache {
-            self.painter
-                .blend_pixmap_at(c.x.round() as i32, c.y.round() as i32, &sc.pixmap);
+        } else if drag_fast {
+            // The drag snapshot excludes the selection. Composite it once and
+            // let the overlay draw the moved entities at their live positions.
+            self.painter.fill_rect(c, bg);
+            if let Some(cc) = &self.background_cache {
+                self.painter
+                    .copy_pixmap_at(c.x.round() as i32, c.y.round() as i32, &cc.pixmap);
+            }
+            if let Some(db) = &self.drag_base {
+                self.painter.blend_pixmap_at(
+                    c.x.round() as i32,
+                    c.y.round() as i32,
+                    db,
+                );
+            }
+        } else {
+            let signature = self.static_signature();
+            let static_valid = self
+                .static_cache
+                .as_ref()
+                .map(|sc| {
+                    sc.w == cw
+                        && sc.h == ch
+                        && sc.scale_bits == scale_bits
+                        && sc.cx_bits == cx_bits
+                        && sc.cy_bits == cy_bits
+                        && sc.signature == signature
+                })
+                .unwrap_or(false);
+            if !static_valid {
+                if let Some(pixmap) = self.build_static_layer() {
+                    self.static_cache = Some(StaticCache {
+                        w: cw,
+                        h: ch,
+                        scale_bits,
+                        cx_bits,
+                        cy_bits,
+                        signature,
+                        pixmap,
+                    });
+                }
+            }
+            // Background and geometry are combined once into an opaque base
+            // layer. Every warm frame then pays for a single row copy instead
+            // of a copy of the grid plus a full-canvas alpha blend.
+            let base_valid = self
+                .base_cache
+                .as_ref()
+                .map(|bc| {
+                    bc.w == cw
+                        && bc.h == ch
+                        && bc.scale_bits == scale_bits
+                        && bc.cx_bits == cx_bits
+                        && bc.cy_bits == cy_bits
+                        && bc.bg == self.settings.bg
+                        && bc.grid == self.grid
+                        && bc.signature == signature
+                })
+                .unwrap_or(false);
+            if !base_valid {
+                if let (Some(cc), Some(sc)) = (&self.background_cache, &self.static_cache) {
+                    if let Some(base) = Pixmap::new(cw, ch) {
+                        let mut bp = crate::gfx::Painter { pixmap: base };
+                        bp.copy_pixmap_at(0, 0, &cc.pixmap);
+                        bp.blend_pixmap_at(0, 0, &sc.pixmap);
+                        self.base_cache = Some(BaseCache {
+                            w: cw,
+                            h: ch,
+                            scale_bits,
+                            cx_bits,
+                            cy_bits,
+                            bg: self.settings.bg,
+                            grid: self.grid,
+                            signature,
+                            pixmap: bp.pixmap,
+                        });
+                    }
+                }
+            }
+            if let Some(bc) = &self.base_cache {
+                self.painter
+                    .copy_pixmap_at(c.x.round() as i32, c.y.round() as i32, &bc.pixmap);
+            }
         }
 
-        let entities = self.doc.entities.clone();
-        let selected = self.selected.clone();
-        let hover = self.hover;
+        // Only the selected and hovered entities are overlaid. The previous
+        // loop walked the whole drawing (and cloned it) on every mouse move.
+        let view = self.visible_world(12.0);
+        let selected_entities: Vec<crate::model::Entity> = self
+            .selected
+            .iter()
+            .filter_map(|id| self.doc.get(*id))
+            .filter(|e| e.bbox().intersects(&view))
+            .cloned()
+            .collect();
+        let hovered = self
+            .hover
+            .and_then(|id| self.doc.get(id))
+            .filter(|e| e.bbox().intersects(&view))
+            .cloned();
         let mut handles: Vec<(f32, f32)> = Vec::new();
-        for e in &entities {
-            let is_sel = selected.contains(&e.id);
-            let is_hover = hover == Some(e.id);
-            if is_sel {
-                let glow = select.with_alpha(38);
-                self.stroke_entity(e, glow, 5.0);
-                self.stroke_entity(e, select, 2.0);
-                for p in entity_handles(e) {
-                    let s = self.w2s(p);
-                    handles.push(s);
-                }
-            } else if is_hover {
-                self.stroke_entity(e, select.with_alpha(190), 1.45);
+        for e in &selected_entities {
+            for p in entity_handles(e) {
+                handles.push(self.w2s(p));
             }
+        }
+        if !selected_entities.is_empty() {
+            if selected_entities.len() <= 512 {
+                let mut glow = tiny_skia::PathBuilder::new();
+                let mut solid = tiny_skia::PathBuilder::new();
+                for e in &selected_entities {
+                    self.push_entity_path(&mut glow, e);
+                    self.push_entity_path(&mut solid, e);
+                }
+                self.painter.stroke_batch(glow, select.with_alpha(38), 5.0);
+                self.painter.stroke_batch(solid, select, 2.0);
+            } else {
+                // Huge selections rasterize faster one primitive at a time.
+                for e in &selected_entities {
+                    self.stroke_entity_one(e, select.with_alpha(38), 5.0);
+                    self.stroke_entity_one(e, select, 2.0);
+                }
+            }
+        }
+        if let Some(e) = &hovered {
+            let mut path = tiny_skia::PathBuilder::new();
+            self.push_entity_path(&mut path, e);
+            self.painter
+                .stroke_batch(path, select.with_alpha(190), 1.45);
         }
         for h in handles {
             self.painter.fill_rect(Rect::new(h.0 - 2.5, h.1 - 2.5, 5.0, 5.0), select);
@@ -3129,6 +3529,13 @@ impl App {
     }
 
     fn build_static_layer(&mut self) -> Option<Pixmap> {
+        self.build_static_layer_excluding(&[])
+    }
+
+    /// Build the cached drawing layer, optionally omitting entities that are
+    /// being dragged. The excluded layer stays valid while the selection moves,
+    /// so a drag frame only has to stroke the moved entities on top.
+    fn build_static_layer_excluding(&mut self, exclude: &[u64]) -> Option<Pixmap> {
         let c = self.canvas;
         let cw = c.w.max(1.0) as u32;
         let ch = c.h.max(1.0) as u32;
@@ -3137,23 +3544,57 @@ impl App {
         let real_pixmap = std::mem::replace(&mut self.painter.pixmap, pixmap);
         self.canvas = Rect::new(0.0, 0.0, cw as f32, ch as f32);
         let (_, _, _, entity, select, text) = self.canvas_palette();
-        let entities = self.doc.entities.clone();
-        for e in &entities {
-            self.stroke_entity(e, entity, 1.45);
+        let excluded: std::collections::HashSet<u64> = exclude.iter().copied().collect();
+        // Ask the spatial index for what is on screen instead of testing every
+        // entity. Zoomed into a detail of a large import this is the
+        // difference between a handful of strokes and tens of thousands.
+        let view_world = self.visible_world(12.0);
+        let mut ids = Vec::new();
+        self.doc.query_rect(view_world, &mut ids);
+        let visible: Vec<crate::model::Entity> = ids
+            .iter()
+            .filter(|id| !excluded.contains(id))
+            .filter_map(|id| self.doc.get(*id))
+            .cloned()
+            .collect();
+        // Dense drawings are faster when each small primitive gets its own
+        // tight rasterization bounds; one canvas-sized batch is slower there.
+        // Selection overlays (usually small) are batched separately below.
+        for e in &visible {
+            self.stroke_entity_one(e, entity, 1.45);
             if self.settings.show_center {
                 if let Some(center) = entity_center(e) {
                     let s = self.w2s(center);
-                    self.painter.line(s.0 - 5.0, s.1, s.0 + 5.0, s.1, text.with_alpha(150), 1.0);
-                    self.painter.line(s.0, s.1 - 5.0, s.0, s.1 + 5.0, text.with_alpha(150), 1.0);
+                    self.painter.line(
+                        s.0 - 5.0,
+                        s.1,
+                        s.0 + 5.0,
+                        s.1,
+                        text.with_alpha(150),
+                        1.0,
+                    );
+                    self.painter.line(
+                        s.0,
+                        s.1 - 5.0,
+                        s.0,
+                        s.1 + 5.0,
+                        text.with_alpha(150),
+                        1.0,
+                    );
                 }
             }
         }
         if self.settings.show_node {
-            for p in self.doc.intersections() {
+            let mut nodes = tiny_skia::PathBuilder::new();
+            for p in self.doc.intersections_in(view_world) {
                 let s = self.w2s(p);
-                self.painter.line(s.0 - 4.0, s.1 - 4.0, s.0 + 4.0, s.1 + 4.0, text.with_alpha(180), 1.0);
-                self.painter.line(s.0 - 4.0, s.1 + 4.0, s.0 + 4.0, s.1 - 4.0, text.with_alpha(180), 1.0);
+                nodes.move_to(s.0 - 4.0, s.1 - 4.0);
+                nodes.line_to(s.0 + 4.0, s.1 + 4.0);
+                nodes.move_to(s.0 - 4.0, s.1 + 4.0);
+                nodes.line_to(s.0 + 4.0, s.1 - 4.0);
             }
+            self.painter
+                .stroke_batch(nodes, text.with_alpha(180), 1.0);
         }
         if self.settings.show_cut {
             if let Some(job) = self.cut_job.clone() {
@@ -3180,79 +3621,17 @@ impl App {
     fn static_signature(&self) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         let mut h = DefaultHasher::new();
-        self.doc.title.hash(&mut h);
-        self.doc.part.hash(&mut h);
-        self.doc.unit.hash(&mut h);
-        self.doc.programmer.hash(&mut h);
-        self.doc.note.hash(&mut h);
+        // O(1): the document and the overlay keep their own revision counters.
+        // Hashing every entity on every frame was measurable on imported
+        // drawings with tens of thousands of elements.
+        self.doc.uid().hash(&mut h);
+        self.doc.revision().hash(&mut h);
         self.doc.entities.len().hash(&mut h);
-        for e in &self.doc.entities {
-            e.id.hash(&mut h);
-            match &e.kind {
-                Kind::Point { p } => {
-                    0u8.hash(&mut h);
-                    p.x.to_bits().hash(&mut h);
-                    p.y.to_bits().hash(&mut h);
-                }
-                Kind::Line { a, b } => {
-                    1u8.hash(&mut h);
-                    a.x.to_bits().hash(&mut h);
-                    a.y.to_bits().hash(&mut h);
-                    b.x.to_bits().hash(&mut h);
-                    b.y.to_bits().hash(&mut h);
-                }
-                Kind::Circle { c, r } => {
-                    2u8.hash(&mut h);
-                    c.x.to_bits().hash(&mut h);
-                    c.y.to_bits().hash(&mut h);
-                    r.to_bits().hash(&mut h);
-                }
-                Kind::Arc { c, r, a0, sweep } => {
-                    3u8.hash(&mut h);
-                    c.x.to_bits().hash(&mut h);
-                    c.y.to_bits().hash(&mut h);
-                    r.to_bits().hash(&mut h);
-                    a0.to_bits().hash(&mut h);
-                    sweep.to_bits().hash(&mut h);
-                }
-            }
-        }
         self.settings.show_center.hash(&mut h);
         self.settings.show_node.hash(&mut h);
         self.settings.show_cut.hash(&mut h);
         self.settings.bg.hash(&mut h);
-        if let Some(job) = &self.cut_job {
-            job.paths.len().hash(&mut h);
-            for p in &job.paths {
-                p.segs.len().hash(&mut h);
-                p.closed.hash(&mut h);
-                p.pierce.x.to_bits().hash(&mut h);
-                p.pierce.y.to_bits().hash(&mut h);
-                if let Some(lead) = &p.lead {
-                    lead.start().x.to_bits().hash(&mut h);
-                    lead.start().y.to_bits().hash(&mut h);
-                    lead.end().x.to_bits().hash(&mut h);
-                    lead.end().y.to_bits().hash(&mut h);
-                }
-                for seg in &p.segs {
-                    match seg {
-                        crate::codegen::Seg::Line { a, b } => {
-                            a.x.to_bits().hash(&mut h);
-                            b.x.to_bits().hash(&mut h);
-                            a.y.to_bits().hash(&mut h);
-                            b.y.to_bits().hash(&mut h);
-                        }
-                        crate::codegen::Seg::Arc { c, r, a0, sweep } => {
-                            c.x.to_bits().hash(&mut h);
-                            c.y.to_bits().hash(&mut h);
-                            r.to_bits().hash(&mut h);
-                            a0.to_bits().hash(&mut h);
-                            sweep.to_bits().hash(&mut h);
-                        }
-                    }
-                }
-            }
-        }
+        self.scene_rev.hash(&mut h);
         h.finish()
     }
 
@@ -3296,27 +3675,55 @@ impl App {
         // Axis colours already distinguish the two axes; keep the board clean.
     }
 
-    fn stroke_entity(&mut self, e: &crate::model::Entity, color: Color, width: f32) {
+    /// Stroke one entity. Used by the static layer for dense drawings, where a
+    /// tight per-primitive rasterization area beats one canvas-sized batch.
+    fn stroke_entity_one(&mut self, e: &crate::model::Entity, color: Color, width: f32) {
+        let mut path = tiny_skia::PathBuilder::new();
+        self.push_entity_path(&mut path, e);
+        self.painter.stroke_batch(path, color, width);
+    }
+
+    /// Append one entity's screen-space outline to a shared path. Selection
+    /// overlays stroke several selected entities with one setup call.
+    fn push_entity_path(&self, pb: &mut tiny_skia::PathBuilder, e: &crate::model::Entity) {
         match &e.kind {
             Kind::Point { p } => {
                 let s = self.w2s(*p);
-                self.painter.line(s.0 - 5.0, s.1, s.0 + 5.0, s.1, color, width);
-                self.painter.line(s.0, s.1 - 5.0, s.0, s.1 + 5.0, color, width);
-                self.painter.stroke_circle(s.0, s.1, 2.2, color, width);
+                pb.move_to(s.0 - 5.0, s.1);
+                pb.line_to(s.0 + 5.0, s.1);
+                pb.move_to(s.0, s.1 - 5.0);
+                pb.line_to(s.0, s.1 + 5.0);
+                pb.push_circle(s.0, s.1, 2.2);
             }
             Kind::Line { a, b } => {
                 let sa = self.w2s(*a);
                 let sb = self.w2s(*b);
-                self.painter.line(sa.0, sa.1, sb.0, sb.1, color, width);
+                pb.move_to(sa.0, sa.1);
+                pb.line_to(sb.0, sb.1);
             }
             Kind::Circle { c, r } => {
                 let s = self.w2s(*c);
-                self.painter.stroke_circle(s.0, s.1, r * self.scale, color, width);
+                pb.push_circle(s.0, s.1, r * self.scale);
             }
             Kind::Arc { c, r, a0, sweep } => {
                 let s = self.w2s(*c);
-                self.painter
-                    .stroke_arc(s.0, s.1, r * self.scale, -*a0, -*sweep, color, width);
+                let radius = r * self.scale;
+                if radius <= 0.0 || sweep.abs() < 1e-5 {
+                    return;
+                }
+                // Match the painter's arc flattening: about one point every
+                // four screen pixels, bounded for both tiny and huge arcs.
+                let steps = ((sweep.abs() * radius / 4.0).ceil() as usize).clamp(6, 180);
+                for i in 0..=steps {
+                    let a = -*a0 + -*sweep * (i as f32 / steps as f32);
+                    let x = s.0 + radius * a.cos();
+                    let y = s.1 + radius * a.sin();
+                    if i == 0 {
+                        pb.move_to(x, y);
+                    } else {
+                        pb.line_to(x, y);
+                    }
+                }
             }
         }
     }
@@ -3622,7 +4029,7 @@ impl App {
         self.painter.stroke_rect(field, if focused { C_ACCENT } else { C_BORDER }, if focused { 1.5 } else { 1.0 });
         if self.command.is_empty() {
             self.painter
-                .text_top(field.x + 7.0, field.y + 3.0, "输入坐标，如 20,15", 11.5, C_TEXT_LIGHT);
+                .text_top(field.x + 7.0, field.y + 3.0, "输入命令或坐标，如 line / 20,15", 11.5, C_TEXT_LIGHT);
         } else {
             let txt = truncate_to_width(&self.command, field.w - 12.0, 12.0);
             self.painter.text_top(field.x + 7.0, field.y + 3.0, &txt, 12.0, C_TEXT);
@@ -3965,9 +4372,10 @@ impl App {
 
 impl App {
     fn draw_dialog_ui(&mut self) {
-        let Some(dlg) = self.dialog.clone() else { return };
-        let full = Rect::new(0.0, 0.0, self.w as f32, self.h as f32);
-        self.painter.fill_rect(full, Color::rgba(8, 14, 22, 120));
+        // Take the state out while painting instead of cloning the whole
+        // dialog (including the generated program) on every frame. Drawing
+        // never reads `self.dialog`; it is put back before returning.
+        let Some(dlg) = self.dialog.take() else { return };
         let (pw, ph) = dialog_size(&dlg);
         let panel = Rect::new(
             ((self.w as f32 - pw) * 0.5).max(10.0),
@@ -3975,6 +4383,17 @@ impl App {
             pw,
             ph,
         );
+        self.code_panel = if matches!(dlg, Dialog::Code(_)) {
+            Some(panel)
+        } else {
+            None
+        };
+        if self.code_panel.is_none() {
+            self.code_track = None;
+            self.code_thumb = None;
+            self.code_scroll_max = 0.0;
+            self.code_drag = None;
+        }
         self.painter.fill_round_rect(panel.offset(7.0, 9.0), 7.0, Color::rgba(0, 0, 0, 90));
         self.painter.fill_round_rect(panel, 7.0, Color::from_hex(0xF4F6F9));
         self.painter.stroke_rect(panel, Color::from_hex(0xAAB8C7), 1.0);
@@ -4019,6 +4438,7 @@ impl App {
             Dialog::About => self.draw_about_dialog(body, footer),
             Dialog::Preview => self.draw_preview_dialog(body, footer),
         }
+        self.dialog = Some(dlg);
     }
 
     fn footer_buttons(&mut self, footer: Rect, specs: &[(&str, u8, bool)]) {
@@ -4239,40 +4659,53 @@ impl App {
         self.painter.stroke_rect(area, Color::from_hex(0x2A3A4C), 1.0);
         let font = st.font;
         let line_h = font * 1.5;
-        let total = st.text.lines().count().max(1) as f32;
+        let line_count = st.line_starts.len();
+        let total = line_count.max(1) as f32;
         let max_scroll = (total * line_h - area.h + 16.0).max(0.0);
+        self.code_scroll_max = max_scroll;
         let scroll = st.scroll.clamp(0.0, max_scroll);
-        let first = (scroll / line_h).floor() as usize;
+        let first = ((scroll / line_h).floor() as usize).min(line_count.saturating_sub(1));
         let mut y = area.y + 8.0 - (scroll - first as f32 * line_h);
-        let mut line_no = first + 1;
-        for line in st.text.lines().skip(first) {
+        for (idx, &(a, b)) in st.line_starts.iter().enumerate().skip(first) {
             if y > area.bottom() - 4.0 {
                 break;
             }
-            let num = format!("{:>4}", line_no);
+            let line = &st.text[a as usize..b as usize];
+            let num = format!("{:>4}", idx + 1);
             if self.settings.line_numbers {
                 self.painter.text_top(area.x + 8.0, y, &num, font - 1.0, Color::from_hex(0x5E7893));
             }
             let text_x = area.x + if self.settings.line_numbers { 48.0 } else { 10.0 };
-            let txt = truncate_to_width(line, area.right() - text_x - 10.0, font);
-            let col = if line.trim_start().starts_with('(') || line.trim_start().starts_with("(3B") {
+            let txt = truncate_to_width(line, area.right() - text_x - 18.0, font);
+            let trimmed = line.trim_start();
+            let col = if trimmed.starts_with('(') || trimmed.starts_with("(3B") {
                 Color::from_hex(0x7F96AC)
             } else {
                 Color::from_hex(0xD8E6F2)
             };
             self.painter.text_top(text_x, y, &txt, font, col);
             y += line_h;
-            line_no += 1;
         }
+        // Scrollbar: the thumb can be dragged and the empty track pages up or
+        // down, so the code page behaves like a normal document instead of
+        // only responding to the wheel over a narrow strip.
         if max_scroll > 0.0 {
-            let track = Rect::new(area.right() - 10.0, area.y + 4.0, 8.0, area.h - 8.0);
+            let track = Rect::new(area.right() - 11.0, area.y + 4.0, 8.0, area.h - 8.0);
+            self.code_track = Some(track);
             self.painter.fill_rect(track, Color::from_hex(0x182534));
             let frac = (scroll / max_scroll).clamp(0.0, 1.0);
             let thumb_h = (track.h * (area.h / (total * line_h)).min(1.0)).max(24.0);
+            let thumb = Rect::new(track.x, track.y + (track.h - thumb_h) * frac, 8.0, thumb_h);
+            self.code_thumb = Some(thumb);
+            let hot = self.code_drag.is_some()
+                || track.contains(self.mouse.0, self.mouse.1);
             self.painter.fill_rect(
-                Rect::new(track.x, track.y + (track.h - thumb_h) * frac, 8.0, thumb_h),
-                Color::from_hex(0x6C8BA6),
+                thumb,
+                if hot { Color::from_hex(0x9DB9D2) } else { Color::from_hex(0x6C8BA6) },
             );
+        } else {
+            self.code_track = None;
+            self.code_thumb = None;
         }
         self.footer_buttons(footer, &[("关闭", 2, true)]);
     }
@@ -4489,7 +4922,7 @@ impl App {
         self.painter.fill_round_rect(Rect::new(x, y, 64.0, 64.0), 10.0, Color::from_hex(0x2A5D8C));
         draw_icon(&mut self.painter, Icon::Gear, Rect::new(x + 12.0, y + 12.0, 40.0, 40.0), C_WHITE);
         self.painter.text_top_bold(x + 80.0, y + 6.0, "超越数控线切割编程系统", 18.0, C_TEXT);
-        self.painter.text_top(x + 80.0, y + 32.0, "版本 1.1 · WEDM / FOAM", 12.0, C_TEXT_DIM);
+        self.painter.text_top(x + 80.0, y + 32.0, "版本 1.2 · WEDM / FOAM", 12.0, C_TEXT_DIM);
         self.painter.text_top(x + 80.0, y + 50.0, "绘图 · 切割路径 · 3B / Mach3 G 代码", 12.0, C_TEXT_DIM);
         let text = "面向快走丝 / 中走丝线切割和热丝泡沫切割的绘图与编程工具。\n可以在同一张图板上绘制轮廓、穿丝孔、生成补偿切割路径，\n再输出 3B 或 Mach3 G 代码，并估算加工面积、工时和金额。\n\n泡沫切割模块会自动优化进刀顺序与空走路径，\n可按两轴 X/Y 或四轴 X/Y + A/B 输出。\n\n本程序依据经典线切割编程软件的工作流程重新制作。";
         self.painter
@@ -4678,18 +5111,44 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Byte ranges of the lines in a generated program, matching `str::lines`
+/// (a trailing newline does not create an extra empty line).
+fn code_line_ranges(text: &str) -> Vec<(u32, u32)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            let mut end = i;
+            if end > start && bytes[end - 1] == b'\r' {
+                end -= 1;
+            }
+            out.push((start as u32, end as u32));
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        out.push((start as u32, bytes.len() as u32));
+    }
+    out
+}
+
 fn truncate_to_width(s: &str, max_w: f32, size: f32) -> String {
     let f = fonts();
     if f.ui.width(s, size) <= max_w {
         return s.to_string();
     }
+    // One pass with running width. The old version re-measured the whole
+    // growing prefix for every character, which turned long code lines and
+    // status texts into an O(n^2) job on each frame.
     let mut out = String::new();
+    let mut w = 0.0f32;
     for ch in s.chars() {
-        let mut test = out.clone();
-        test.push(ch);
-        if f.ui.width(&test, size) > max_w {
+        let adv = f.ui.advance(ch, size);
+        if w + adv > max_w {
             break;
         }
+        w += adv;
         out.push(ch);
     }
     out

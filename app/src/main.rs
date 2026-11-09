@@ -2,19 +2,21 @@
 
 mod app;
 mod codegen;
+mod commands;
 mod dxf;
 mod foam;
 mod gfx;
 mod model;
 mod platform;
+mod spatial;
 
 use std::path::PathBuf;
 
 use app::{App, CursorKind};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetDC, InvalidateRect, ReleaseDC, ScreenToClient, UpdateWindow, HDC,
-    PAINTSTRUCT,
+    BeginPaint, EndPaint, GetDC, GetUpdateRect, InvalidateRect, ReleaseDC, ScreenToClient,
+    UpdateWindow, HDC, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -41,10 +43,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if let Some(app) = app {
                 let mut ps: PAINTSTRUCT = std::mem::zeroed();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                if !app.screenshot_mode {
+                let empty = ps.rcPaint.right <= ps.rcPaint.left
+                    || ps.rcPaint.bottom <= ps.rcPaint.top;
+                if !app.screenshot_mode && !empty {
+                    let now = std::time::Instant::now();
+                    if let Some(prev) = app.perf_last_paint {
+                        let gap = now.duration_since(prev).as_secs_f64() * 1000.0;
+                        if gap > app.perf_max_gap_ms {
+                            app.perf_max_gap_ms = gap;
+                        }
+                    }
+                    app.perf_last_paint = Some(now);
+                    app.perf_paints += 1;
                     app.render();
+                    platform::blit(hdc, &app.painter.pixmap);
                 }
-                platform::blit(hdc, &app.painter.pixmap);
+                let _ = hdc;
                 EndPaint(hwnd, &ps);
             } else {
                 let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -60,6 +74,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSEMOVE => {
             if let Some(app) = app {
+                app.perf_input_events += 1;
                 let x = (lp & 0xffff) as i16 as f32;
                 let y = ((lp >> 16) & 0xffff) as i16 as f32;
                 app.on_mouse_move(x, y);
@@ -230,17 +245,112 @@ unsafe fn create_main_window(title: &str, client_w: i32, client_h: i32) -> HWND 
         std::ptr::null_mut(),
     );
     ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
     hwnd
 }
 
-fn parse_args() -> (Option<PathBuf>, Option<String>, Option<usize>, bool, bool, bool) {
+/// Run the normal editor loop. Input is drained first, then the newest state is
+/// presented at a rate chosen for the display. Clicks and keys are presented
+/// immediately; continuous motion (mouse moves, wheel and scrollbar drags) is
+/// coalesced into the next display frame, which is now cheap enough to keep up
+/// with every notch instead of making the person wait for a full redraw.
+fn run_message_loop(hwnd: HWND) {
+    use std::time::{Duration, Instant};
+    const MAX_DRAIN: usize = 512;
+    let refresh = platform::display_refresh_rate(hwnd).clamp(30, 360);
+    let frame_interval =
+        Duration::from_micros(1_000_000 / refresh as u64).max(Duration::from_micros(2000));
+    let mut last_frame = Instant::now() - frame_interval;
+    // Paint-related wake-ups are deliberately excluded: WM_PAINT is handled by
+    // UpdateWindow on our own schedule, so waiting for it would spin.
+    let wake_mask = QS_ALLINPUT & !QS_PAINT;
+    let mut urgent = false;
+    unsafe {
+        loop {
+            let mut quit = false;
+            for _ in 0..MAX_DRAIN {
+                let mut msg: MSG = std::mem::zeroed();
+                if PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) == 0 {
+                    break;
+                }
+                if msg.message == WM_QUIT {
+                    quit = true;
+                    break;
+                }
+                if msg.message == WM_PAINT {
+                    continue;
+                }
+                if matches!(
+                    msg.message,
+                    WM_LBUTTONDOWN
+                        | WM_LBUTTONUP
+                        | WM_LBUTTONDBLCLK
+                        | WM_RBUTTONDOWN
+                        | WM_RBUTTONUP
+                        | WM_MBUTTONDOWN
+                        | WM_MBUTTONUP
+                        | WM_KEYDOWN
+                        | WM_KEYUP
+                        | WM_CHAR
+                ) {
+                    urgent = true;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if quit {
+                break;
+            }
+            let mut update: RECT = std::mem::zeroed();
+            if GetUpdateRect(hwnd, &mut update, 0) != 0 {
+                let elapsed = last_frame.elapsed();
+                if urgent || elapsed >= frame_interval {
+                    // Time the frame from its start, so the time spent drawing
+                    // counts toward the display period instead of being added
+                    // on top of it.
+                    last_frame = Instant::now();
+                    UpdateWindow(hwnd);
+                    urgent = false;
+                    continue;
+                }
+                // Wait only until the next frame is due; any click, key or
+                // wheel arriving meanwhile wakes the loop and is handled at
+                // once instead of being delayed by a sleep.
+                let remain = frame_interval.saturating_sub(elapsed);
+                let ms = ((remain.as_micros() + 999) / 1000).clamp(1, u32::MAX as u128) as u32;
+                let _ = MsgWaitForMultipleObjectsEx(0, std::ptr::null(), ms, wake_mask, 0);
+            } else {
+                let _ = MsgWaitForMultipleObjectsEx(
+                    0,
+                    std::ptr::null(),
+                    u32::MAX,
+                    wake_mask,
+                    0,
+                );
+            }
+        }
+    }
+}
+
+fn parse_args() -> (
+    Option<PathBuf>,
+    Option<String>,
+    Option<usize>,
+    Option<(i32, i32)>,
+    bool,
+    bool,
+    bool,
+    bool,
+    Option<usize>,
+) {
     let mut screenshot = None;
     let mut demo_dialog = None;
     let mut demo_menu = None;
+    let mut window_size = None;
     let mut selftest = false;
     let mut uitest = false;
     let mut bench = false;
+    let mut bench_input = false;
+    let mut bench_large = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         if a == "--screenshot" {
@@ -253,15 +363,89 @@ fn parse_args() -> (Option<PathBuf>, Option<String>, Option<usize>, bool, bool, 
             demo_dialog = Some(v.to_string());
         } else if a == "--demo-menu" {
             demo_menu = it.next().and_then(|s| s.parse::<usize>().ok());
+        } else if a == "--size" {
+            window_size = it.next().and_then(|s| parse_size(&s));
+        } else if let Some(v) = a.strip_prefix("--size=") {
+            window_size = parse_size(v);
         } else if a == "--selftest" {
             selftest = true;
         } else if a == "--uitest" {
             uitest = true;
         } else if a == "--bench" {
             bench = true;
+        } else if a == "--bench-input" {
+            bench_input = true;
+        } else if a == "--bench-large" {
+            bench_large = it
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .or(Some(20_000));
+        } else if let Some(v) = a.strip_prefix("--bench-large=") {
+            bench_large = v.parse::<usize>().ok().or(Some(20_000));
         }
     }
-    (screenshot, demo_dialog, demo_menu, selftest, uitest, bench)
+    (
+        screenshot,
+        demo_dialog,
+        demo_menu,
+        window_size,
+        selftest,
+        uitest,
+        bench,
+        bench_input,
+        bench_large,
+    )
+}
+
+/// A dense, spread-out drawing used to measure interactions at scale: one
+/// line or circle every few millimetres, like a detailed imported DXF.
+fn stress_doc(n: usize) -> model::Doc {
+    use model::{Doc, Kind, Pt};
+    let mut doc = Doc::new();
+    doc.title = format!("压力测试-{n}.cnc");
+    doc.part = "STRESS".to_string();
+    let side = (n as f64).sqrt().ceil() as i64;
+    let step = 4.0f32;
+    let x0 = -(side as f32) * step * 0.5;
+    let y0 = -(side as f32) * step * 0.5;
+    for i in 0..n as i64 {
+        let (col, row) = (i % side, i / side);
+        let x = x0 + col as f32 * step;
+        let y = y0 + row as f32 * step;
+        match i % 5 {
+            0 => {
+                doc.add(Kind::Circle {
+                    c: Pt::new(x, y),
+                    r: step * 0.32,
+                });
+            }
+            1 => {
+                doc.add(Kind::Arc {
+                    c: Pt::new(x, y),
+                    r: step * 0.40,
+                    a0: 0.35,
+                    sweep: std::f32::consts::PI * 1.35,
+                });
+            }
+            2 => {
+                doc.add(Kind::Point { p: Pt::new(x, y) });
+            }
+            _ => {
+                doc.add(Kind::Line {
+                    a: Pt::new(x - step * 0.45, y - step * 0.35),
+                    b: Pt::new(x + step * 0.45, y + step * 0.35),
+                });
+            }
+        }
+    }
+    doc
+}
+
+fn parse_size(s: &str) -> Option<(i32, i32)> {
+    let (w, h) = s.split_once(['x', 'X'])?;
+    let w = w.parse::<i32>().ok()?.clamp(1000, 7680);
+    let h = h.parse::<i32>().ok()?.clamp(700, 4320);
+    Some((w, h))
 }
 
 fn selftest() -> i32 {
@@ -441,6 +625,59 @@ fn selftest() -> i32 {
             return 1;
         }
     }
+
+    // Spatial index: compare a grid query with a brute-force bounds scan and
+    // exercise handle lookup, add, translate and remove invalidation.
+    {
+        use model::BBox;
+        let mut stress = Doc::new();
+        for i in 0..2000 {
+            let x = (i % 50) as f32 * 4.0;
+            let y = (i / 50) as f32 * 4.0;
+            stress.add(Kind::Line {
+                a: Pt::new(x, y),
+                b: Pt::new(x + 3.0, y + 2.0),
+            });
+        }
+        let rect = BBox {
+            min: Pt::new(20.0, 16.0),
+            max: Pt::new(90.0, 60.0),
+        };
+        let mut got = Vec::new();
+        stress.query_rect(rect, &mut got);
+        let mut expected: Vec<u64> = stress
+            .entities
+            .iter()
+            .filter(|e| e.bbox().intersects(&rect))
+            .map(|e| e.id)
+            .collect();
+        got.sort_unstable();
+        expected.sort_unstable();
+        if got != expected {
+            eprintln!("SELFTEST FAIL spatial query mismatch");
+            return 1;
+        }
+        let id = stress.entities[0].id;
+        if stress.pick(Pt::new(0.0, 0.0), 1.0) != Some(id) {
+            eprintln!("SELFTEST FAIL spatial pick");
+            return 1;
+        }
+        stress.translate_ids(&[id], Pt::new(500.0, 500.0));
+        if stress.pick(Pt::new(0.0, 0.0), 1.0) == Some(id) {
+            eprintln!("SELFTEST FAIL spatial index kept a moved entity in place");
+            return 1;
+        }
+        if stress.pick(Pt::new(500.0, 500.0), 1.0) != Some(id) {
+            eprintln!("SELFTEST FAIL spatial index lost a moved entity");
+            return 1;
+        }
+        stress.remove_ids(&[id]);
+        if stress.get(id).is_some() {
+            eprintln!("SELFTEST FAIL handle map survived remove");
+            return 1;
+        }
+        println!("spatial index: 2000 entities query/pick/translate/remove OK");
+    }
     let saved = doc.save_text();
     match Doc::from_text(&saved) {
         Ok(loaded) => {
@@ -472,6 +709,27 @@ fn ui_test(app: &mut App) -> i32 {
     use app::{Act, Dialog, Tool};
     app.screenshot_mode = true;
     app.render();
+    // The shared command table must drive the status-bar command line.
+    app.command = "line".to_string();
+    app.on_key(13, false, false);
+    if app.tool != Tool::Line {
+        eprintln!("UITEST FAIL command 'line' did not select the line tool");
+        return 1;
+    }
+    app.command = "直线".to_string();
+    app.on_key(13, false, false);
+    if app.tool != Tool::Line {
+        eprintln!("UITEST FAIL Chinese command alias did not resolve");
+        return 1;
+    }
+    app.command = "?".to_string();
+    app.on_key(13, false, false);
+    if !matches!(app.dialog, Some(Dialog::Message { .. })) {
+        eprintln!("UITEST FAIL command help did not open");
+        return 1;
+    }
+    app.on_key(27, false, false);
+    app.do_act(Act::SetTool(Tool::Select));
     let Some((x, y)) = app.menu_tab_center(6) else {
         eprintln!("UITEST FAIL no menu tab");
         return 1;
@@ -789,6 +1047,99 @@ fn ui_test(app: &mut App) -> i32 {
         eprintln!("UITEST FAIL foam code dialog missing");
         return 1;
     }
+    // The code page behaves like a normal scrollable document: wheel over the
+    // dialog, paging keys, Home/End and a draggable scrollbar.
+    let Some(area) = app.code_page_area() else {
+        eprintln!("UITEST FAIL code page area missing");
+        return 1;
+    };
+    let limit = app.code_scroll_limit();
+    if limit <= 4.0 {
+        eprintln!("UITEST FAIL code page is not scrollable (limit {limit})");
+        return 1;
+    }
+    let (cx, cy) = area.center();
+    if app.code_scroll_value().unwrap_or(0.0) != 0.0 {
+        eprintln!("UITEST FAIL code page did not start at the top");
+        return 1;
+    }
+    app.on_wheel(cx, cy, -120);
+    app.render();
+    let after_wheel = app.code_scroll_value().unwrap_or(0.0);
+    if after_wheel <= 0.0 {
+        eprintln!("UITEST FAIL wheel did not scroll the code page");
+        return 1;
+    }
+    app.on_key(34, false, false); // PageDown
+    app.render();
+    let after_page = app.code_scroll_value().unwrap_or(0.0);
+    if after_page <= after_wheel {
+        eprintln!("UITEST FAIL PageDown did not scroll the code page");
+        return 1;
+    }
+    app.on_key(35, false, false); // End
+    app.render();
+    if (app.code_scroll_value().unwrap_or(0.0) - limit).abs() > 1.0 {
+        eprintln!("UITEST FAIL End did not reach the bottom");
+        return 1;
+    }
+    app.on_key(36, false, false); // Home
+    app.render();
+    if app.code_scroll_value().unwrap_or(0.0) != 0.0 {
+        eprintln!("UITEST FAIL Home did not return to the top");
+        return 1;
+    }
+    let Some(thumb) = app.code_scroll_thumb() else {
+        eprintln!("UITEST FAIL code scrollbar thumb missing");
+        return 1;
+    };
+    let (tx, ty) = thumb.center();
+    let was_screenshot = app.screenshot_mode;
+    app.screenshot_mode = false;
+    app.on_left_down(tx, ty, false);
+    app.on_mouse_move(tx, ty + 90.0);
+    app.on_left_up(tx, ty + 90.0);
+    app.screenshot_mode = was_screenshot;
+    app.render();
+    let after_drag = app.code_scroll_value().unwrap_or(0.0);
+    if after_drag <= 0.0 || after_drag > limit + 0.5 {
+        eprintln!("UITEST FAIL dragging the code scrollbar ({after_drag} of {limit})");
+        return 1;
+    }
+    app.on_key(36, false, false); // Home
+    app.render();
+    let Some(track) = app.code_scroll_track() else {
+        eprintln!("UITEST FAIL code scrollbar track missing");
+        return 1;
+    };
+    app.on_left_down(track.center().0, track.bottom() - 4.0, false);
+    app.on_left_up(track.center().0, track.bottom() - 4.0);
+    app.render();
+    if app.code_scroll_value().unwrap_or(0.0) <= 0.0 {
+        eprintln!("UITEST FAIL track click did not page the code view");
+        return 1;
+    }
+    for _ in 0..30 {
+        app.on_wheel(cx, cy, 120);
+    }
+    app.render();
+    if app.code_scroll_value().unwrap_or(0.0) != 0.0 {
+        eprintln!("UITEST FAIL code scroll did not clamp at the top");
+        return 1;
+    }
+    // Timed proof that scrolling repaints are cheap; also exercises many
+    // different line bitmaps, which used to trigger periodic cache rebuilds.
+    let scroll_start = std::time::Instant::now();
+    for _ in 0..60 {
+        app.on_wheel(cx, cy, -120);
+        app.render();
+    }
+    let scroll_ms = scroll_start.elapsed().as_secs_f64() * 1000.0 / 60.0;
+    println!("UITEST INFO code scroll frame: {scroll_ms:.2} ms");
+    if scroll_ms > 12.0 {
+        eprintln!("UITEST FAIL code scrolling is still slow ({scroll_ms:.2} ms/frame)");
+        return 1;
+    }
     let Some((x, y)) = app.dialog_button_center(2) else {
         eprintln!("UITEST FAIL foam code close button missing");
         return 1;
@@ -801,15 +1152,27 @@ fn ui_test(app: &mut App) -> i32 {
 }
 
 fn main() {
-    let (screenshot, demo_dialog, demo_menu, do_selftest, do_uitest, do_bench) = parse_args();
+    let (
+        screenshot,
+        demo_dialog,
+        demo_menu,
+        window_size,
+        do_selftest,
+        do_uitest,
+        do_bench,
+        do_bench_input,
+        bench_large,
+    ) = parse_args();
     if do_selftest {
         std::process::exit(selftest());
     }
     unsafe {
         SetProcessDPIAware();
     }
+    platform::begin_high_res_timer();
+    let (win_w, win_h) = window_size.unwrap_or((1360, 860));
     let hwnd = unsafe {
-        create_main_window("超越数控线切割编程系统 - 示例零件", 1360, 860)
+        create_main_window("超越数控线切割编程系统 - 示例零件", win_w, win_h)
     };
     if hwnd == 0 {
         eprintln!("failed to create window");
@@ -832,6 +1195,96 @@ fn main() {
             DestroyWindow(hwnd);
         }
         std::process::exit(code);
+    }
+    if let Some(n) = bench_large {
+        app.doc = stress_doc(n);
+        app.fitted = false;
+        app.render();
+        for _ in 0..3 {
+            app.render();
+        }
+        if let Some(path) = &screenshot {
+            if let Ok(png) = app.painter.png() {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(path, png);
+                println!("stress screenshot saved: {}", path.display());
+            }
+        }
+        let canvas = app.canvas;
+        let events = 300;
+        let t = std::time::Instant::now();
+        for i in 0..events {
+            let x = canvas.x + 40.0 + (i * 71 % 900) as f32;
+            let y = canvas.y + 30.0 + (i * 53 % 620) as f32;
+            app.on_mouse_move(x, y);
+        }
+        let input = t.elapsed().as_secs_f64() * 1000.0 / events as f64;
+        let frames = 30;
+        let t = std::time::Instant::now();
+        for i in 0..frames {
+            app.view_center.x += 0.8 + (i % 3) as f32 * 0.4;
+            app.render();
+        }
+        let frame = t.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        // A typical working view is zoomed into one detail rather than fitted
+        // to the whole plate. Measure that case separately: the spatial index
+        // should keep the redraw proportional to what is on screen.
+        app.scale *= 4.0;
+        app.render();
+        let t = std::time::Instant::now();
+        for i in 0..frames {
+            app.view_center.x += 0.35 + (i % 3) as f32 * 0.2;
+            app.render();
+        }
+        let zoomed = t.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        // Panning should reuse the last composed frame instead of rebuilding.
+        app.scale /= 4.0;
+        app.render();
+        app.on_middle_down(canvas.x + 20.0, canvas.y + 20.0);
+        let t = std::time::Instant::now();
+        for _ in 0..frames {
+            app.view_center.x += 0.5;
+            app.render();
+        }
+        let pan = t.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        app.on_middle_up();
+        // Dragging a selection should composite the drag snapshot instead of
+        // re-rasterizing the whole drawing on every mouse message.
+        let drag = if let Some(e) = app.doc.entities.first() {
+            let p = e.bbox().center();
+            let s = app.w2s_public(p);
+            app.selected = vec![e.id];
+            app.on_left_down(s.0, s.1, false);
+            app.on_mouse_move(s.0 + 8.0, s.1 + 3.0);
+            let t = std::time::Instant::now();
+            for i in 0..frames {
+                app.on_mouse_move(s.0 + 8.0 + i as f32 * 0.7, s.1 + 3.0);
+                app.render();
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+            app.on_left_up(s.0 + 8.0, s.1 + 3.0);
+            Some(ms)
+        } else {
+            None
+        };
+        println!(
+            "large drawing benchmark: {n} entities, hover+snap {:.3} ms/event, changed-view frame {:.2} ms ({:.0} fps), zoomed changed-view {:.2} ms ({:.0} fps), pan frame {:.2} ms ({:.0} fps), drag frame {}",
+            input,
+            frame,
+            1000.0 / frame.max(0.001),
+            zoomed,
+            1000.0 / zoomed.max(0.001),
+            pan,
+            1000.0 / pan.max(0.001),
+            drag.map(|ms| format!("{ms:.2} ms ({:.0} fps)", 1000.0 / ms.max(0.001)))
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+        return;
     }
     if do_bench {
         app.render();
@@ -856,6 +1309,45 @@ fn main() {
             "render + present benchmark: {frames} frames, {:.2} ms/frame ({:.0} fps)",
             avg,
             1000.0 / avg.max(0.001)
+        );
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+        return;
+    }
+    if do_bench_input {
+        // Feed a realistic burst of mouse movement through the actual Win32
+        // message queue and count the frames the paint path actually presents.
+        let hwnd_bits = hwnd as usize;
+        unsafe {
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
+        let started = std::time::Instant::now();
+        let feeder = std::thread::spawn(move || {
+            let hwnd = hwnd_bits as HWND;
+            for i in 0..2400usize {
+                let x = 460 + (i * 37 % 780) as i16;
+                let y = 210 + (i * 23 % 480) as i16;
+                let lp = ((y as isize) & 0xffff) << 16 | ((x as isize) & 0xffff);
+                unsafe {
+                    PostMessageW(hwnd, WM_MOUSEMOVE, 0, lp);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            unsafe {
+                PostMessageW(hwnd, WM_QUIT, 0, 0);
+            }
+        });
+        run_message_loop(hwnd);
+        let _ = feeder.join();
+        let secs = started.elapsed().as_secs_f64();
+        println!(
+            "input benchmark: {} mouse messages dispatched, {} paints in {:.2}s = {:.1} fps, max paint gap {:.1} ms",
+            app.perf_input_events,
+            app.perf_paints,
+            secs,
+            app.perf_paints as f64 / secs.max(0.001),
+            app.perf_max_gap_ms
         );
         unsafe {
             DestroyWindow(hwnd);
@@ -901,14 +1393,7 @@ fn main() {
         return;
     }
     unsafe {
-        let mut msg: MSG = std::mem::zeroed();
-        loop {
-            let r = GetMessageW(&mut msg, 0, 0, 0);
-            if r <= 0 {
-                break;
-            }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        InvalidateRect(hwnd, std::ptr::null(), 0);
     }
+    run_message_loop(hwnd);
 }

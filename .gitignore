@@ -2,6 +2,7 @@
 /app/target/
 /app/shots/
 /dist/chaoyue-cnc-1.1.0-win64/
+/dist/chaoyue-cnc-1.2.0-win64/
 
 # Craft Anything / analysis working files
 /checks/
